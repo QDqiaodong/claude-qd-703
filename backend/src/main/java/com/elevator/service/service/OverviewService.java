@@ -77,13 +77,14 @@ public class OverviewService {
         long faultOpen = 0;
         long faultTrapped = 0;
         for (FaultReport report : faultRepository.findAll()) {
-            if (!ElevatorDict.F_FIXED.equals(report.getStatus())) {
+            if (!ElevatorDict.isFaultClosed(report.getStatus())) {
                 faultOpen++;
                 if (report.getTrapped() != null && report.getTrapped() > 0) {
                     faultTrapped++;
                 }
             }
         }
+        long emergencyActive = elevatorRepository.countByStatus(ElevatorDict.ST_EMERGENCY);
         BigDecimal partAmount = BigDecimal.ZERO;
         for (PartReplacement part : partRepository.findAll()) {
             if (!"VOID".equals(part.getStatus()) && part.getAmount() != null) {
@@ -104,6 +105,7 @@ public class OverviewService {
                 orderPending,
                 faultOpen,
                 faultTrapped,
+                emergencyActive,
                 partAmount.setScale(2, java.math.RoundingMode.HALF_UP));
     }
 }

@@ -15,12 +15,14 @@ import com.elevator.service.common.BizException;
 import com.elevator.service.domain.Building;
 import com.elevator.service.domain.Elevator;
 import com.elevator.service.domain.ElevatorDict;
+import com.elevator.service.domain.FaultReport;
 import com.elevator.service.domain.FilterNames;
 import com.elevator.service.domain.Unit;
 import com.elevator.service.dto.ElevatorDtos;
 import com.elevator.service.dto.Views;
 import com.elevator.service.repository.BuildingRepository;
 import com.elevator.service.repository.ElevatorRepository;
+import com.elevator.service.repository.FaultReportRepository;
 import com.elevator.service.repository.UnitRepository;
 
 /**
@@ -37,15 +39,18 @@ public class ElevatorService {
     private final ElevatorRepository elevatorRepository;
     private final UnitRepository unitRepository;
     private final BuildingRepository buildingRepository;
+    private final FaultReportRepository faultRepository;
     private final FilterScope filterScope;
 
     public ElevatorService(ElevatorRepository elevatorRepository,
                            UnitRepository unitRepository,
                            BuildingRepository buildingRepository,
+                           FaultReportRepository faultRepository,
                            FilterScope filterScope) {
         this.elevatorRepository = elevatorRepository;
         this.unitRepository = unitRepository;
         this.buildingRepository = buildingRepository;
+        this.faultRepository = faultRepository;
         this.filterScope = filterScope;
     }
 
@@ -181,6 +186,12 @@ public class ElevatorService {
         if (!ElevatorDict.isValidElevatorStatus(target)) {
             throw new BizException("电梯状态只能是 RUNNING/OUT_OF_SERVICE/REPAIRING/INSPECTING，收到的是：" + status);
         }
+        if (ElevatorDict.ST_EMERGENCY.equals(elevator.getStatus()) && !ElevatorDict.ST_EMERGENCY.equals(target)) {
+            throw new BizException("电梯正被应急处置占用，不能手工改状态，需由应急报修闭环或撤销后自动恢复");
+        }
+        if (ElevatorDict.ST_EMERGENCY.equals(target)) {
+            throw new BizException("应急维修状态只能由应急报修受理时自动进入，不能手工设置");
+        }
         elevator.setStatus(target);
         elevator.setUpdatedAt(LocalDateTime.now());
         elevatorRepository.save(elevator);
@@ -208,6 +219,14 @@ public class ElevatorService {
     private Views.ElevatorView toView(Elevator elevator, Map<Long, String> unitNo, Map<Long, String> buildingName) {
         String uNo = unitNo.getOrDefault(elevator.getUnitId(), "");
         String bName = buildingName.getOrDefault(elevator.getBuildingId(), "");
+        String emergencyFaultNo = null;
+        String emergencyOrderNo = null;
+        if (ElevatorDict.ST_EMERGENCY.equals(elevator.getStatus()) && elevator.getEmergencyFaultId() != null) {
+            emergencyFaultNo = faultRepository.findById(elevator.getEmergencyFaultId())
+                    .map(FaultReport::getFaultNo).orElse(null);
+            emergencyOrderNo = faultRepository.findById(elevator.getEmergencyFaultId())
+                    .map(FaultReport::getOrderNo).orElse(null);
+        }
         return new Views.ElevatorView(
                 elevator.getId(),
                 elevator.getElevatorNo(),
@@ -228,6 +247,9 @@ public class ElevatorService {
                 ElevatorDict.elevatorStatusName(elevator.getStatus()),
                 currentFloorOf(elevator),
                 inspectDueDays(elevator.getNextInspectDate()),
+                ElevatorDict.ST_EMERGENCY.equals(elevator.getStatus()),
+                emergencyFaultNo,
+                emergencyOrderNo,
                 elevator.getUpdatedAt());
     }
 

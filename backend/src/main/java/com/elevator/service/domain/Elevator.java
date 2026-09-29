@@ -76,9 +76,17 @@ public class Elevator {
     @Column(name = "maint_vendor", length = 64)
     private String maintVendor;
 
-    /** RUNNING 运行 / OUT_OF_SERVICE 停用 / REPAIRING 维修 / INSPECTING 年检中 */
+    /** RUNNING 运行 / OUT_OF_SERVICE 停用 / REPAIRING 维修 / INSPECTING 年检中 / EMERGENCY_REPAIR 应急维修 */
     @Column(name = "status", nullable = false, length = 16)
     private String status;
+
+    /** 进入应急维修前的原状态，闭环后据此恢复；非应急占用时为 NULL */
+    @Column(name = "prev_status", length = 16)
+    private String prevStatus;
+
+    /** 当前占用该电梯的有效应急报修单 id，与 emergency_lock 表一致 */
+    @Column(name = "emergency_fault_id")
+    private Long emergencyFaultId;
 
     /** 当前停靠楼层（井道剖面图上轿厢位置） */
     @Column(name = "current_floor")

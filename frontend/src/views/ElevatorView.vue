@@ -58,9 +58,12 @@
           </template>
         </el-table-column>
         <el-table-column prop="maintVendor" label="维保单位" min-width="170" />
-        <el-table-column label="状态" width="90">
+        <el-table-column label="状态" width="110">
           <template #default="{ row }">
             <el-tag size="small" :type="statusType(row.status)">{{ row.statusName }}</el-tag>
+            <div v-if="row.emergencyOccupied" style="font-size: 12px; color: #c62828; margin-top: 2px">
+              ⛔ {{ row.emergencyFaultNo }} / {{ row.emergencyOrderNo }}
+            </div>
           </template>
         </el-table-column>
         <el-table-column prop="currentFloor" label="停靠层" width="70" align="right" />
@@ -70,6 +73,7 @@
               :model-value="row.status"
               size="small"
               style="width: 130px"
+              :disabled="row.emergencyOccupied"
               @change="(v) => changeStatus(row, v)"
             >
               <el-option label="运行" value="RUNNING" />
@@ -98,10 +102,17 @@ const form = reactive({
 })
 
 function statusType (status) {
-  return { RUNNING: 'success', OUT_OF_SERVICE: 'info', REPAIRING: 'warning', INSPECTING: 'primary' }[status] || 'info'
+  return {
+    RUNNING: 'success',
+    OUT_OF_SERVICE: 'info',
+    REPAIRING: 'warning',
+    INSPECTING: 'primary',
+    EMERGENCY_REPAIR: 'danger'
+  }[status] || 'info'
 }
 
 function rowClass ({ row }) {
+  if (row.emergencyOccupied) return 'row-emergency'
   return row.status === 'OUT_OF_SERVICE' ? 'row-out' : ''
 }
 

@@ -19,21 +19,26 @@
         <el-table-column prop="planDate" label="计划执行日" width="110" />
         <el-table-column prop="team" label="维保班组" width="90" />
         <el-table-column prop="worker" label="维保员" width="80" />
-        <el-table-column label="状态" width="90">
+        <el-table-column label="状态" width="100">
           <template #default="{ row }">
             <el-tag size="small" :type="statusType(row.status)">{{ row.statusName }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="remark" label="备注" min-width="150" />
+        <el-table-column prop="remark" label="备注 / 占用原因" min-width="200">
+          <template #default="{ row }">
+            <div>{{ row.remark }}</div>
+            <div v-if="row.occupied" style="color: #c62828; font-size: 12px">⛔ {{ row.occupiedReason }}</div>
+          </template>
+        </el-table-column>
         <el-table-column label="操作" width="210">
           <template #default="{ row }">
-            <el-button size="small" type="success" plain :disabled="isDone(row)" @click="executePlan(row)">
+            <el-button size="small" type="success" plain :disabled="isPlanDone(row)" @click="executePlan(row)">
               执行
             </el-button>
-            <el-button size="small" type="warning" plain :disabled="isDone(row)" @click="delayPlan(row)">
+            <el-button size="small" type="warning" plain :disabled="isPlanDone(row)" @click="delayPlan(row)">
               延期
             </el-button>
-            <el-button size="small" type="info" plain :disabled="isDone(row)" @click="voidPlan(row)">
+            <el-button size="small" type="info" plain :disabled="isPlanDone(row)" @click="voidPlan(row)">
               作废
             </el-button>
           </template>
@@ -70,14 +75,25 @@
         <el-button size="small" type="primary" @click="createOrder">开单</el-button>
       </div>
 
-      <el-table :data="orders" size="small" border stripe>
-        <el-table-column prop="orderNo" label="工单号" width="120" />
+      <el-table :data="orders" size="small" border stripe :row-class-name="orderRowClass">
+        <el-table-column prop="orderNo" label="工单号" width="120">
+          <template #default="{ row }">
+            <b :style="{ color: row.orderKind === 'EMERGENCY' ? '#c62828' : '' }">{{ row.orderNo }}</b>
+            <el-tag v-if="row.orderKind === 'EMERGENCY'" size="small" type="danger" effect="plain" style="margin-left: 4px">抢修</el-tag>
+          </template>
+        </el-table-column>
         <el-table-column prop="planNo" label="来源计划" width="120" />
+        <el-table-column label="关联报修" width="120">
+          <template #default="{ row }">{{ row.faultNo || '—' }}</template>
+        </el-table-column>
         <el-table-column prop="elevatorNo" label="电梯" width="120" />
         <el-table-column prop="buildingName" label="楼宇" width="130" />
         <el-table-column prop="cycleName" label="周期" width="70" />
         <el-table-column prop="planDate" label="计划执行日" width="110" />
         <el-table-column prop="worker" label="维保员" width="80" />
+        <el-table-column label="实际到场" width="150">
+          <template #default="{ row }">{{ row.arriveTime ? String(row.arriveTime).replace('T', ' ').slice(0, 16) : '—' }}</template>
+        </el-table-column>
         <el-table-column prop="executeResult" label="执行结果" min-width="180" />
         <el-table-column prop="actualDate" label="实际完成日" width="110" />
         <el-table-column label="状态" width="90">
@@ -87,15 +103,23 @@
         </el-table-column>
         <el-table-column label="操作" width="210">
           <template #default="{ row }">
-            <el-button size="small" type="success" plain :disabled="isDone(row)" @click="executeOrder(row)">
-              执行
-            </el-button>
-            <el-button size="small" type="warning" plain :disabled="isDone(row)" @click="delayOrder(row)">
-              延期
-            </el-button>
-            <el-button size="small" type="info" plain :disabled="isDone(row)" @click="voidOrder(row)">
-              作废
-            </el-button>
+            <template v-if="row.orderKind === 'EMERGENCY'">
+              <el-tag size="small" type="danger" effect="plain">应急联动</el-tag>
+              <el-button size="small" type="warning" plain @click="jumpFault(row)">
+                {{ isTerminal(row.status) ? '查看报修' : '去处置' }}
+              </el-button>
+            </template>
+            <template v-else>
+              <el-button size="small" type="success" plain :disabled="isDone(row)" @click="executeOrder(row)">
+                执行
+              </el-button>
+              <el-button size="small" type="warning" plain :disabled="isDone(row)" @click="delayOrder(row)">
+                延期
+              </el-button>
+              <el-button size="small" type="info" plain :disabled="isDone(row)" @click="voidOrder(row)">
+                作废
+              </el-button>
+            </template>
           </template>
         </el-table-column>
       </el-table>
@@ -105,10 +129,12 @@
 
 <script setup>
 import { inject, onMounted, reactive, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
 import { elevatorApi, orderApi, planApi } from '../api'
 
 const es = inject('es')
+const nav = useRouter()
 const plans = ref([])
 const orders = ref([])
 const elevatorOptions = ref([])
@@ -128,11 +154,39 @@ function cycleColor (cycle) {
 }
 
 function statusType (status) {
-  return { PENDING: 'warning', DONE: 'success', DELAYED: 'danger', VOID: 'info' }[status] || 'info'
+  return {
+    PENDING: 'warning',
+    DONE: 'success',
+    DELAYED: 'danger',
+    SUSPENDED: 'danger',
+    PROCESSING: 'warning',
+    WAIT_ACCEPT: 'primary',
+    FIXED: 'success',
+    CANCELLED: 'info',
+    VOID: 'info'
+  }[status] || 'info'
 }
 
 function isDone (row) {
-  return row.status === 'DONE' || row.status === 'VOID'
+  return row.status === 'DONE' || row.status === 'VOID' || row.status === 'FIXED' || row.status === 'CANCELLED'
+}
+
+function isPlanDone (row) {
+  return isDone(row) || row.status === 'SUSPENDED'
+}
+
+function isTerminal (status) {
+  return status === 'FIXED' || status === 'CANCELLED'
+}
+
+function orderRowClass ({ row }) {
+  if (row.orderKind === 'EMERGENCY' && !isTerminal(row.status)) return 'row-emergency'
+  if (row.status === 'CANCELLED') return 'row-closed'
+  return ''
+}
+
+function jumpFault (row) {
+  nav.push('/faults')
 }
 
 async function load () {

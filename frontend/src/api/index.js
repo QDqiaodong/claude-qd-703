@@ -81,12 +81,21 @@ export const orderApi = {
   void: (id) => http.post(`/orders/${id}/void`)
 }
 
-/** 模块四：故障报修 */
+/** 模块四：故障报修（含应急联动） */
 export const faultApi = {
   list: (buildingId, elevatorId) => http.get('/faults', { params: paramsOf(buildingId, elevatorId) }),
   create: (data) => http.post('/faults', data),
   advance: (id) => http.post(`/faults/${id}/advance`),
-  fix: (id, handleResult) => http.post(`/faults/${id}/fix`, { handleResult })
+  fix: (id, handleResult) => http.post(`/faults/${id}/fix`, { handleResult }),
+  /** 受理应急报修：自动生成抢修工单、电梯进入应急维修 */
+  accept: (id, data) => http.post(`/faults/${id}/accept`, data || {}),
+  /** 处置：处理中 → 待验收（处理结果 + 实际到场时间） */
+  process: (id, data) => http.post(`/faults/${id}/process`, data),
+  /** 验收闭环：待验收 → 已修复（确认电梯恢复运行） */
+  close: (id, data) => http.post(`/faults/${id}/close`, data),
+  /** 误报撤销：必须填撤销原因，进入「已撤销」终态 */
+  cancel: (id, data) => http.post(`/faults/${id}/cancel`, data),
+  logs: (id) => http.get(`/faults/${id}/logs`)
 }
 
 /** 模块五：配件更换 */

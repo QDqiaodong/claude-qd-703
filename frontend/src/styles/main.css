@@ -487,6 +487,16 @@ body {
   color: var(--es-danger);
 }
 
+/* 应急联动：停梯等高风险行（非困人）浅橙，已闭环/已撤销行灰化 */
+.el-table .row-emergency {
+  --el-table-tr-bg-color: #fff3e6;
+}
+
+.el-table .row-closed {
+  --el-table-tr-bg-color: #f5f7f5;
+  color: #8d8d8d;
+}
+
 .el-table .row-out {
   --el-table-tr-bg-color: #f5f5f5;
   color: #8d8d8d;

@@ -54,9 +54,21 @@ public class MaintenancePlan {
     @Column(name = "worker", length = 32)
     private String worker;
 
-    /** PENDING 待执行 / DONE 已执行 / DELAYED 已延期 / VOID 作废 */
+    /** PENDING 待执行 / DONE 已执行 / DELAYED 已延期 / SUSPENDED 应急暂停 / VOID 作废 */
     @Column(name = "status", nullable = false, length = 16)
     private String status;
+
+    /** 被哪张应急报修占用（SUSPENDED 时有值，闭环后清空，原状态恢复） */
+    @Column(name = "occupied_by_fault_id")
+    private Long occupiedByFaultId;
+
+    /** 被占用原因，如「应急抢修 FR-2026-0007 占用电梯，计划暂停」 */
+    @Column(name = "occupied_reason", length = 128)
+    private String occupiedReason;
+
+    /** 暂停前的原状态，恢复时使用 */
+    @Column(name = "prev_status", length = 16)
+    private String prevStatus;
 
     @Column(name = "remark", length = 128)
     private String remark;

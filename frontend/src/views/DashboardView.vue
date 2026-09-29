@@ -291,6 +291,7 @@ const carColor = computed(
     RUNNING: '#ef6c00',
     REPAIRING: '#ff9800',
     INSPECTING: '#1e88e5',
+    EMERGENCY_REPAIR: '#c62828',
     OUT_OF_SERVICE: '#9e9e9e'
   })[shaft.value.status] || '#9e9e9e'
 )

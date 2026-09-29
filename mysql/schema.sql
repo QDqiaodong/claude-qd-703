@@ -22,6 +22,11 @@
 --   [R4.3] 到达超 30 分钟红线        → FR-2026-0007 arrive = 46 分钟
 --   [R5.1] 金额 = 数量 × 单价        → service 计算，页面底部汇总
 --   [R5.2] 关联单号可追溯            → ref_type = ORDER / FAULT
+--   [R6.1] 应急联动状态机            → 困人/停梯 emergency=1：待受理→抢修中→待验收→已修复；误报=已撤销
+--   [R6.2] 受理生成抢修单 EX-xxxx    → FR-2026-0007/0008 已受理，电梯 13/14=EMERGENCY_REPAIR(prev 可恢复)
+--   [R6.3] 占用互斥                  → elevator_emergency_lock 唯一键：一梯同时只有一张有效抢修单
+--   [R6.4] 计划保留并标占用原因       → MP-2026-0029/0030=SUSPENDED，闭环后恢复 PENDING/DELAYED
+--   [R6.5] 历史闭环应急单             → EX-2026-0003/0004/0005 与 FR-0002/0005/0016 三方单号一致
 -- ============================================================================
 
 SET NAMES utf8mb4;
@@ -31,6 +36,8 @@ CREATE DATABASE IF NOT EXISTS elevator_service DEFAULT CHARACTER SET utf8mb4 COL
 USE elevator_service;
 
 DROP TABLE IF EXISTS part_replacement;
+DROP TABLE IF EXISTS fault_operation_log;
+DROP TABLE IF EXISTS elevator_emergency_lock;
 DROP TABLE IF EXISTS fault_report;
 DROP TABLE IF EXISTS maintenance_order;
 DROP TABLE IF EXISTS maintenance_plan;
@@ -89,7 +96,9 @@ CREATE TABLE elevator (
     last_inspect_date DATE         NULL COMMENT '上次年检日',
     next_inspect_date DATE         NULL COMMENT '下次年检日',
     maint_vendor      VARCHAR(64)  NULL COMMENT '维保单位',
-    status            VARCHAR(16)  NOT NULL COMMENT 'RUNNING 运行 / OUT_OF_SERVICE 停用 / REPAIRING 维修 / INSPECTING 年检中',
+    status            VARCHAR(16)  NOT NULL COMMENT 'RUNNING 运行 / OUT_OF_SERVICE 停用 / REPAIRING 维修 / INSPECTING 年检中 / EMERGENCY_REPAIR 应急维修',
+    prev_status       VARCHAR(16)  NULL COMMENT '进入应急维修前的原状态，闭环后恢复',
+    emergency_fault_id BIGINT      NULL COMMENT '当前占用该电梯的有效应急报修单 id',
     current_floor     INT          NULL COMMENT '当前停靠楼层',
     updated_at        DATETIME     NULL,
     PRIMARY KEY (id),
@@ -112,7 +121,10 @@ CREATE TABLE maintenance_plan (
     plan_date   DATE        NOT NULL COMMENT '计划执行日（甘特条落点）',
     team        VARCHAR(32) NULL COMMENT '维保班组',
     worker      VARCHAR(32) NULL COMMENT '维保员',
-    status      VARCHAR(16) NOT NULL COMMENT 'PENDING 待执行 / DONE 已执行 / DELAYED 已延期 / VOID 作废',
+    status      VARCHAR(16) NOT NULL COMMENT 'PENDING 待执行 / DONE 已执行 / DELAYED 已延期 / SUSPENDED 应急暂停 / VOID 作废',
+    occupied_by_fault_id BIGINT NULL COMMENT '被哪张应急报修占用',
+    occupied_reason VARCHAR(128) NULL COMMENT '被占用原因（含应急报修单号）',
+    prev_status VARCHAR(16) NULL COMMENT '暂停前原状态，闭环后恢复',
     remark      VARCHAR(128) NULL COMMENT '备注',
     updated_at  DATETIME    NULL,
     PRIMARY KEY (id),
@@ -125,18 +137,22 @@ CREATE TABLE maintenance_plan (
 
 CREATE TABLE maintenance_order (
     id             BIGINT      NOT NULL AUTO_INCREMENT,
-    order_no       VARCHAR(24) NOT NULL COMMENT '工单号',
-    plan_id        BIGINT      NULL COMMENT '来源计划 id，临时派工为空',
+    order_no       VARCHAR(24) NOT NULL COMMENT '工单号（应急抢修单 EX-2026-xxxx）',
+    plan_id        BIGINT      NULL COMMENT '来源计划 id，临时派工/应急抢修为空',
     elevator_id    BIGINT      NOT NULL COMMENT '电梯 id',
     unit_id        BIGINT      NOT NULL COMMENT '单元 id',
     building_id    BIGINT      NOT NULL COMMENT '冗余楼宇 id',
-    cycle          VARCHAR(16) NOT NULL COMMENT '维保周期',
+    order_kind     VARCHAR(16) NOT NULL DEFAULT 'NORMAL' COMMENT 'NORMAL 常规维保 / EMERGENCY 应急抢修',
+    cycle          VARCHAR(16) NULL COMMENT '维保周期（应急单可空）',
     plan_date      DATE        NULL COMMENT '计划执行日',
     team           VARCHAR(32) NULL COMMENT '维保班组',
     worker         VARCHAR(32) NULL COMMENT '维保员',
     execute_result VARCHAR(255) NULL COMMENT '执行结果',
     actual_date    DATE        NULL COMMENT '实际完成日',
-    status         VARCHAR(16) NOT NULL COMMENT 'PENDING 待执行 / DONE 已执行 / DELAYED 已延期 / VOID 作废',
+    status         VARCHAR(16) NOT NULL COMMENT '常规：PENDING/DONE/DELAYED/VOID；应急抢修：PENDING/PROCESSING/WAIT_ACCEPT/FIXED/CANCELLED',
+    fault_id       BIGINT      NULL COMMENT '应急抢修关联的故障报修单 id',
+    fault_no       VARCHAR(24) NULL COMMENT '应急抢修关联的报修单号',
+    arrive_time    DATETIME    NULL COMMENT '实际到场时间',
     remark         VARCHAR(128) NULL COMMENT '备注',
     updated_at     DATETIME    NULL,
     PRIMARY KEY (id),
@@ -144,8 +160,9 @@ CREATE TABLE maintenance_order (
     KEY idx_order_plan (plan_id),
     KEY idx_order_elevator (elevator_id),
     KEY idx_order_building (building_id),
-    KEY idx_order_status (status)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '维保工单';
+    KEY idx_order_status (status),
+    KEY idx_order_fault (fault_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '维保工单（含应急抢修单）';
 
 -- ----------------------------------------------------------------------------
 -- 模块四：故障报修
@@ -157,21 +174,65 @@ CREATE TABLE fault_report (
     unit_id          BIGINT      NOT NULL COMMENT '单元 id',
     building_id      BIGINT      NOT NULL COMMENT '冗余楼宇 id',
     fault_type       VARCHAR(16) NOT NULL COMMENT 'TRAPPED 困人 / NOISE 异响 / LEVELING 不平层 / STOPPED 停梯 / DOOR 门系统 / OTHER 其他',
+    emergency        TINYINT     NOT NULL DEFAULT 0 COMMENT '是否应急联动故障（困人/停梯）：1 是 / 0 否',
+    risk_level       VARCHAR(16) NULL COMMENT 'HIGH 高风险 / NORMAL 普通',
     report_time      DATETIME    NOT NULL COMMENT '报修时间',
+    accept_time      DATETIME    NULL COMMENT '受理时间',
+    assignee         VARCHAR(32) NULL COMMENT '当前负责人',
     response_minutes INT         NULL COMMENT '响应时长（分钟）',
     arrive_minutes   INT         NULL COMMENT '到达时长（分钟）',
+    arrive_time      DATETIME    NULL COMMENT '实际到场时间（闭环必填）',
     fix_time         DATETIME    NULL COMMENT '修复时间',
     trapped          INT         NULL COMMENT '是否困人：1 是 / 0 否',
     handle_result    VARCHAR(255) NULL COMMENT '处理结果',
+    cancel_reason    VARCHAR(255) NULL COMMENT '误报撤销原因',
     reporter         VARCHAR(32) NULL COMMENT '报修人',
-    status           VARCHAR(16) NOT NULL COMMENT 'PENDING 待处理 / PROCESSING 处理中 / FIXED 已修复',
+    order_id         BIGINT      NULL COMMENT '关联抢修工单 id',
+    order_no         VARCHAR(24) NULL COMMENT '关联抢修工单号',
+    confirm_user     VARCHAR(32) NULL COMMENT '闭环验收人',
+    status           VARCHAR(16) NOT NULL COMMENT 'PENDING 待处理 / PROCESSING 处理中 / WAIT_ACCEPT 待验收 / FIXED 已修复 / CANCELLED 已撤销',
+    stage            VARCHAR(16) NULL COMMENT '处置阶段：待受理/抢修中/待验收/已修复/已撤销',
     updated_at       DATETIME    NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uk_fault_no (fault_no),
     KEY idx_fault_elevator (elevator_id),
     KEY idx_fault_building (building_id),
-    KEY idx_fault_status (status)
-) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '故障报修';
+    KEY idx_fault_status (status),
+    KEY idx_fault_order (order_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '故障报修（含应急联动）';
+
+-- ----------------------------------------------------------------------------
+-- 模块四-扩展：电梯应急占用锁 + 应急处置操作记录
+-- ----------------------------------------------------------------------------
+CREATE TABLE elevator_emergency_lock (
+    id          BIGINT      NOT NULL AUTO_INCREMENT,
+    elevator_id BIGINT      NOT NULL COMMENT '被占用电梯 id',
+    fault_id    BIGINT      NOT NULL COMMENT '当前有效应急报修单 id',
+    fault_no    VARCHAR(24) NOT NULL COMMENT '应急报修单号',
+    order_id    BIGINT      NULL COMMENT '抢修工单 id',
+    order_no    VARCHAR(24) NULL COMMENT '抢修工单号',
+    locked_by   VARCHAR(32) NULL COMMENT '加锁（受理）操作员',
+    created_at  DATETIME    NOT NULL COMMENT '加锁时间',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_lock_elevator (elevator_id),
+    UNIQUE KEY uk_lock_fault (fault_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '电梯应急占用锁（一台电梯最多一行）';
+
+CREATE TABLE fault_operation_log (
+    id          BIGINT      NOT NULL AUTO_INCREMENT,
+    fault_id    BIGINT      NOT NULL COMMENT '报修单 id',
+    fault_no    VARCHAR(24) NOT NULL COMMENT '报修单号',
+    action      VARCHAR(16) NOT NULL COMMENT 'CREATE/ACCEPT/ADVANCE/CANCEL/CLOSE/REJECT',
+    from_status VARCHAR(16) NULL COMMENT '操作前状态',
+    to_status   VARCHAR(16) NULL COMMENT '操作后状态',
+    operator    VARCHAR(32) NULL COMMENT '操作员',
+    detail      VARCHAR(255) NULL COMMENT '操作说明',
+    order_id    BIGINT      NULL COMMENT '关联抢修工单 id',
+    order_no    VARCHAR(24) NULL COMMENT '关联抢修工单号',
+    created_at  DATETIME    NOT NULL COMMENT '操作时间',
+    PRIMARY KEY (id),
+    KEY idx_log_fault (fault_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '应急处置操作记录（只追加）';
 
 -- ----------------------------------------------------------------------------
 -- 模块五：配件更换
@@ -240,43 +301,45 @@ INSERT INTO unit (id, unit_no, building_id, floor_count, elevator_count, note, s
     (17, 'U-BL003-03', 3,  45, 2, '写字楼裙房，台账待补', 'ACTIVE',   NOW()),
     (18, 'U-BL004-02', 4,  38, 2, '写字楼裙房，台账待补', 'ACTIVE',   NOW());
 
--- [R2.2] EL-2008-005 / EL-2003-021 / EL-2006-035 停用；年检中 / 维修中各两台
-INSERT INTO elevator (id, elevator_no, unit_id, building_id, brand, model, rated_load, rated_speed, floor_station, install_date, last_inspect_date, next_inspect_date, maint_vendor, status, current_floor, updated_at) VALUES
-    (1,  'EL-2008-001', 1,  1,  '通力',   'MonoSpace 1000', 1000, 2.50, 32, '2008-06-18', '2025-06-20', DATE_ADD(NOW(), INTERVAL 240 DAY), '上海安捷电梯维保有限公司', 'RUNNING',        12, NOW()),
-    (2,  'EL-2008-002', 1,  1,  '通力',   'MonoSpace 800',   800, 2.50, 32, '2008-06-18', '2025-06-20', DATE_ADD(NOW(), INTERVAL 120 DAY), '上海安捷电梯维保有限公司', 'RUNNING',         7, NOW()),
-    (3,  'EL-2008-003', 1,  1,  '迅达',   'Schindler 5400', 1000, 3.00, 32, '2008-09-02', '2025-09-02', DATE_ADD(NOW(), INTERVAL 20 DAY),  '上海安捷电梯维保有限公司', 'REPAIRING',       1, NOW()),
-    (4,  'EL-2008-004', 2,  1,  '通力',   'MonoSpace 1000', 1000, 2.50, 32, '2008-06-18', '2025-06-20', DATE_ADD(NOW(), INTERVAL 60 DAY),  '上海安捷电梯维保有限公司', 'RUNNING',         5, NOW()),
-    (5,  'EL-2008-005', 2,  1,  '迅达',   'Schindler 3300',  800, 2.00, 32, '2008-06-18', '2025-01-15', DATE_SUB(NOW(), INTERVAL 15 DAY),  '上海安捷电梯维保有限公司', 'OUT_OF_SERVICE',  1, NOW()),
-    (6,  'EL-2009-006', 3,  2,  '蒂升',   'TWIN 1350',      1350, 3.00, 32, '2009-03-11', '2025-03-11', DATE_ADD(NOW(), INTERVAL 90 DAY),  '上海安捷电梯维保有限公司', 'RUNNING',        21, NOW()),
-    (7,  'EL-2009-007', 3,  2,  '蒂升',   'TWIN 1000',      1000, 2.50, 32, '2009-03-11', '2025-03-11', DATE_ADD(NOW(), INTERVAL 90 DAY),  '上海安捷电梯维保有限公司', 'RUNNING',         3, NOW()),
-    (8,  'EL-2009-008', 3,  2,  '三菱',   'NEXWAY-S 1000',  1000, 2.50, 32, '2009-05-20', '2025-05-20', DATE_SUB(NOW(), INTERVAL 5 DAY),   '上海安捷电梯维保有限公司', 'INSPECTING',     16, NOW()),
-    (9,  'EL-2009-009', 4,  2,  '三菱',   'NEXWAY-S 800',    800, 2.00, 28, '2009-05-20', '2025-05-20', DATE_ADD(NOW(), INTERVAL 150 DAY), '上海安捷电梯维保有限公司', 'RUNNING',         9, NOW()),
-    (10, 'EL-2009-010', 4,  2,  '通力',   'MonoSpace 800',   800, 2.00, 28, '2009-08-08', '2025-08-08', DATE_ADD(NOW(), INTERVAL 200 DAY), '上海安捷电梯维保有限公司', 'RUNNING',         1, NOW()),
-    (11, 'EL-2015-011', 5,  3,  '蒂升',   'TWIN 1600',      1600, 4.00, 45, '2015-11-02', '2025-11-02', DATE_ADD(NOW(), INTERVAL 300 DAY), '上海安捷电梯维保有限公司', 'RUNNING',        33, NOW()),
-    (12, 'EL-2015-012', 5,  3,  '蒂升',   'TWIN 1600',      1600, 4.00, 45, '2015-11-02', '2025-11-02', DATE_ADD(NOW(), INTERVAL 300 DAY), '上海安捷电梯维保有限公司', 'RUNNING',         8, NOW()),
-    (13, 'EL-2015-013', 5,  3,  '迅达',   'Schindler 7000', 1350, 3.50, 45, '2015-11-02', '2025-11-02', DATE_ADD(NOW(), INTERVAL 300 DAY), '上海安捷电梯维保有限公司', 'RUNNING',        27, NOW()),
-    (14, 'EL-2015-014', 5,  3,  '迅达',   'Schindler 7000', 1350, 3.50, 45, '2015-11-02', '2025-02-18', DATE_SUB(NOW(), INTERVAL 40 DAY),  '上海安捷电梯维保有限公司', 'REPAIRING',       2, NOW()),
-    (15, 'EL-2015-015', 6,  3,  '三菱',   'NEXWAY-S 1600',  1600, 4.00, 45, '2015-12-19', '2025-12-19', DATE_ADD(NOW(), INTERVAL 320 DAY), '上海安捷电梯维保有限公司', 'RUNNING',        40, NOW()),
-    (16, 'EL-2015-016', 6,  3,  '三菱',   'NEXWAY-S 1350',  1350, 3.50, 45, '2015-12-19', '2025-12-19', DATE_ADD(NOW(), INTERVAL 320 DAY), '上海安捷电梯维保有限公司', 'RUNNING',        15, NOW()),
-    (17, 'EL-2015-017', 7,  4,  '通力',   'MonoSpace 1350', 1350, 3.00, 38, '2015-07-07', '2025-07-07', DATE_ADD(NOW(), INTERVAL 180 DAY), '上海安捷电梯维保有限公司', 'RUNNING',        22, NOW()),
-    (18, 'EL-2015-018', 7,  4,  '通力',   'MonoSpace 1000', 1000, 2.50, 38, '2015-07-07', '2025-07-07', DATE_SUB(NOW(), INTERVAL 2 DAY),   '上海安捷电梯维保有限公司', 'INSPECTING',     30, NOW()),
-    (19, 'EL-2015-019', 7,  4,  '蒂升',   'TWIN 1000',      1000, 2.50, 38, '2015-07-07', '2025-07-07', DATE_ADD(NOW(), INTERVAL 180 DAY), '上海安捷电梯维保有限公司', 'RUNNING',         6, NOW()),
-    (20, 'EL-2003-020', 8,  5,  '三菱',   'GPS-III 800',     800, 1.75, 18, '2003-10-15', '2025-10-15', DATE_ADD(NOW(), INTERVAL 45 DAY),  '上海安捷电梯维保有限公司', 'RUNNING',        11, NOW()),
-    (21, 'EL-2003-021', 8,  5,  '三菱',   'GPS-III 800',     800, 1.75, 18, '2003-10-15', '2024-10-15', DATE_SUB(NOW(), INTERVAL 90 DAY),  '上海安捷电梯维保有限公司', 'OUT_OF_SERVICE',  1, NOW()),
-    (22, 'EL-2003-022', 9,  5,  '通力',   'MonoSpace 1000', 1000, 2.00, 18, '2003-10-15', '2025-10-15', DATE_ADD(NOW(), INTERVAL 45 DAY),  '上海安捷电梯维保有限公司', 'RUNNING',        14, NOW()),
-    (23, 'EL-2004-023', 10, 6,  '迅达',   'Schindler 3300',  800, 1.75, 18, '2004-04-22', '2025-04-22', DATE_ADD(NOW(), INTERVAL 30 DAY),  '上海安捷电梯维保有限公司', 'RUNNING',        17, NOW()),
-    (24, 'EL-2004-024', 10, 6,  '迅达',   'Schindler 3300',  800, 1.75, 18, '2004-04-22', '2025-04-22', DATE_ADD(NOW(), INTERVAL 30 DAY),  '上海安捷电梯维保有限公司', 'RUNNING',         4, NOW()),
-    (25, 'EL-2019-025', 11, 7,  '蒂升',   'TWIN 1000',      1000, 2.50, 12, '2019-09-09', '2025-09-09', DATE_ADD(NOW(), INTERVAL 210 DAY), '上海安捷电梯维保有限公司', 'RUNNING',         9, NOW()),
-    (26, 'EL-2019-026', 11, 7,  '蒂升',   'TWIN 800',        800, 2.00, 12, '2019-09-09', '2025-09-09', DATE_ADD(NOW(), INTERVAL 210 DAY), '上海安捷电梯维保有限公司', 'RUNNING',         1, NOW()),
-    (27, 'EL-2011-027', 12, 8,  '三菱',   'NEXWAY-S 1600',  1600, 2.50, 16, '2011-05-30', '2025-05-30', DATE_ADD(NOW(), INTERVAL 100 DAY), '上海安捷电梯维保有限公司', 'RUNNING',        12, NOW()),
-    (28, 'EL-2011-028', 12, 8,  '三菱',   'NEXWAY-S 1600',  1600, 2.50, 16, '2011-05-30', '2025-05-30', DATE_ADD(NOW(), INTERVAL 100 DAY), '上海安捷电梯维保有限公司', 'RUNNING',         5, NOW()),
-    (29, 'EL-2011-029', 12, 8,  '通力',   'MonoSpace 1000', 1000, 2.00, 16, '2011-05-30', '2025-05-30', DATE_SUB(NOW(), INTERVAL 10 DAY),  '上海安捷电梯维保有限公司', 'REPAIRING',       3, NOW()),
-    (30, 'EL-2013-030', 13, 9,  '迅达',   'Schindler 5400', 1000, 1.75,  6, '2013-12-01', '2025-12-01', DATE_ADD(NOW(), INTERVAL 260 DAY), '上海安捷电梯维保有限公司', 'RUNNING',         4, NOW()),
-    (31, 'EL-2013-031', 13, 9,  '迅达',   'Schindler 5400', 1000, 1.75,  6, '2013-12-01', '2025-12-01', DATE_ADD(NOW(), INTERVAL 260 DAY), '上海安捷电梯维保有限公司', 'RUNNING',         2, NOW()),
-    (32, 'EL-1998-032', 14, 10, '三菱',   'GPS-II 500',      500, 1.00,  5, '1998-08-08', '2025-08-08', DATE_ADD(NOW(), INTERVAL 15 DAY),  '上海安捷电梯维保有限公司', 'RUNNING',         3, NOW()),
-    (33, 'EL-2020-033', 15, 11, '蒂升',   'TWIN 2000',      2000, 2.50,  4, '2020-10-01', '2025-10-01', DATE_ADD(NOW(), INTERVAL 350 DAY), '上海安捷电梯维保有限公司', 'RUNNING',         1, NOW()),
-    (34, 'EL-2020-034', 15, 11, '蒂升',   'TWIN 2000',      2000, 2.50,  4, '2020-10-01', '2025-10-01', DATE_SUB(NOW(), INTERVAL 25 DAY),  '上海安捷电梯维保有限公司', 'INSPECTING',      2, NOW()),
-    (35, 'EL-2006-035', 16, 12, '通力',   'MonoSpace 800',   800, 1.75, 26, '2006-02-14', '2024-02-14', DATE_SUB(NOW(), INTERVAL 200 DAY), '上海安捷电梯维保有限公司', 'OUT_OF_SERVICE',  1, NOW());
+-- [R2.2] EL-2008-005 / EL-2003-021 / EL-2006-035 停用；年检中两台
+-- [应急] EL-2015-013(13)/EL-2015-014(14) 已被 FR-2026-0007/0008 受理占用：
+--        EMERGENCY_REPAIR（prev_status=REPAIRING），闭环后恢复维修态
+INSERT INTO elevator (id, elevator_no, unit_id, building_id, brand, model, rated_load, rated_speed, floor_station, install_date, last_inspect_date, next_inspect_date, maint_vendor, status, prev_status, emergency_fault_id, current_floor, updated_at) VALUES
+    (1,  'EL-2008-001', 1,  1,  '通力',   'MonoSpace 1000', 1000, 2.50, 32, '2008-06-18', '2025-06-20', DATE_ADD(NOW(), INTERVAL 240 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,        12, NOW()),
+    (2,  'EL-2008-002', 1,  1,  '通力',   'MonoSpace 800',   800, 2.50, 32, '2008-06-18', '2025-06-20', DATE_ADD(NOW(), INTERVAL 120 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         7, NOW()),
+    (3,  'EL-2008-003', 1,  1,  '迅达',   'Schindler 5400', 1000, 3.00, 32, '2008-09-02', '2025-09-02', DATE_ADD(NOW(), INTERVAL 20 DAY),  '上海安捷电梯维保有限公司', 'REPAIRING', NULL, NULL,       1, NOW()),
+    (4,  'EL-2008-004', 2,  1,  '通力',   'MonoSpace 1000', 1000, 2.50, 32, '2008-06-18', '2025-06-20', DATE_ADD(NOW(), INTERVAL 60 DAY),  '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         5, NOW()),
+    (5,  'EL-2008-005', 2,  1,  '迅达',   'Schindler 3300',  800, 2.00, 32, '2008-06-18', '2025-01-15', DATE_SUB(NOW(), INTERVAL 15 DAY),  '上海安捷电梯维保有限公司', 'OUT_OF_SERVICE', NULL, NULL,  1, NOW()),
+    (6,  'EL-2009-006', 3,  2,  '蒂升',   'TWIN 1350',      1350, 3.00, 32, '2009-03-11', '2025-03-11', DATE_ADD(NOW(), INTERVAL 90 DAY),  '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,        21, NOW()),
+    (7,  'EL-2009-007', 3,  2,  '蒂升',   'TWIN 1000',      1000, 2.50, 32, '2009-03-11', '2025-03-11', DATE_ADD(NOW(), INTERVAL 90 DAY),  '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         3, NOW()),
+    (8,  'EL-2009-008', 3,  2,  '三菱',   'NEXWAY-S 1000',  1000, 2.50, 32, '2009-05-20', '2025-05-20', DATE_SUB(NOW(), INTERVAL 5 DAY),   '上海安捷电梯维保有限公司', 'INSPECTING', NULL, NULL,     16, NOW()),
+    (9,  'EL-2009-009', 4,  2,  '三菱',   'NEXWAY-S 800',    800, 2.00, 28, '2009-05-20', '2025-05-20', DATE_ADD(NOW(), INTERVAL 150 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         9, NOW()),
+    (10, 'EL-2009-010', 4,  2,  '通力',   'MonoSpace 800',   800, 2.00, 28, '2009-08-08', '2025-08-08', DATE_ADD(NOW(), INTERVAL 200 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         1, NOW()),
+    (11, 'EL-2015-011', 5,  3,  '蒂升',   'TWIN 1600',      1600, 4.00, 45, '2015-11-02', '2025-11-02', DATE_ADD(NOW(), INTERVAL 300 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,        33, NOW()),
+    (12, 'EL-2015-012', 5,  3,  '蒂升',   'TWIN 1600',      1600, 4.00, 45, '2015-11-02', '2025-11-02', DATE_ADD(NOW(), INTERVAL 300 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         8, NOW()),
+    (13, 'EL-2015-013', 5,  3,  '迅达',   'Schindler 7000', 1350, 3.50, 45, '2015-11-02', '2025-11-02', DATE_ADD(NOW(), INTERVAL 300 DAY), '上海安捷电梯维保有限公司', 'EMERGENCY_REPAIR', 'RUNNING', 7, 27, NOW()),
+    (14, 'EL-2015-014', 5,  3,  '迅达',   'Schindler 7000', 1350, 3.50, 45, '2015-11-02', '2025-02-18', DATE_SUB(NOW(), INTERVAL 40 DAY),  '上海安捷电梯维保有限公司', 'EMERGENCY_REPAIR', 'REPAIRING', 8, 2, NOW()),
+    (15, 'EL-2015-015', 6,  3,  '三菱',   'NEXWAY-S 1600',  1600, 4.00, 45, '2015-12-19', '2025-12-19', DATE_ADD(NOW(), INTERVAL 320 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,        40, NOW()),
+    (16, 'EL-2015-016', 6,  3,  '三菱',   'NEXWAY-S 1350',  1350, 3.50, 45, '2015-12-19', '2025-12-19', DATE_ADD(NOW(), INTERVAL 320 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,        15, NOW()),
+    (17, 'EL-2015-017', 7,  4,  '通力',   'MonoSpace 1350', 1350, 3.00, 38, '2015-07-07', '2025-07-07', DATE_ADD(NOW(), INTERVAL 180 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,        22, NOW()),
+    (18, 'EL-2015-018', 7,  4,  '通力',   'MonoSpace 1000', 1000, 2.50, 38, '2015-07-07', '2025-07-07', DATE_SUB(NOW(), INTERVAL 2 DAY),   '上海安捷电梯维保有限公司', 'INSPECTING', NULL, NULL,     30, NOW()),
+    (19, 'EL-2015-019', 7,  4,  '蒂升',   'TWIN 1000',      1000, 2.50, 38, '2015-07-07', '2025-07-07', DATE_ADD(NOW(), INTERVAL 180 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         6, NOW()),
+    (20, 'EL-2003-020', 8,  5,  '三菱',   'GPS-III 800',     800, 1.75, 18, '2003-10-15', '2025-10-15', DATE_ADD(NOW(), INTERVAL 45 DAY),  '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,        11, NOW()),
+    (21, 'EL-2003-021', 8,  5,  '三菱',   'GPS-III 800',     800, 1.75, 18, '2003-10-15', '2024-10-15', DATE_SUB(NOW(), INTERVAL 90 DAY),  '上海安捷电梯维保有限公司', 'OUT_OF_SERVICE', NULL, NULL,  1, NOW()),
+    (22, 'EL-2003-022', 9,  5,  '通力',   'MonoSpace 1000', 1000, 2.00, 18, '2003-10-15', '2025-10-15', DATE_ADD(NOW(), INTERVAL 45 DAY),  '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,        14, NOW()),
+    (23, 'EL-2004-023', 10, 6,  '迅达',   'Schindler 3300',  800, 1.75, 18, '2004-04-22', '2025-04-22', DATE_ADD(NOW(), INTERVAL 30 DAY),  '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,        17, NOW()),
+    (24, 'EL-2004-024', 10, 6,  '迅达',   'Schindler 3300',  800, 1.75, 18, '2004-04-22', '2025-04-22', DATE_ADD(NOW(), INTERVAL 30 DAY),  '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         4, NOW()),
+    (25, 'EL-2019-025', 11, 7,  '蒂升',   'TWIN 1000',      1000, 2.50, 12, '2019-09-09', '2025-09-09', DATE_ADD(NOW(), INTERVAL 210 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         9, NOW()),
+    (26, 'EL-2019-026', 11, 7,  '蒂升',   'TWIN 800',        800, 2.00, 12, '2019-09-09', '2025-09-09', DATE_ADD(NOW(), INTERVAL 210 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         1, NOW()),
+    (27, 'EL-2011-027', 12, 8,  '三菱',   'NEXWAY-S 1600',  1600, 2.50, 16, '2011-05-30', '2025-05-30', DATE_ADD(NOW(), INTERVAL 100 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,        12, NOW()),
+    (28, 'EL-2011-028', 12, 8,  '三菱',   'NEXWAY-S 1600',  1600, 2.50, 16, '2011-05-30', '2025-05-30', DATE_ADD(NOW(), INTERVAL 100 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         5, NOW()),
+    (29, 'EL-2011-029', 12, 8,  '通力',   'MonoSpace 1000', 1000, 2.00, 16, '2011-05-30', '2025-05-30', DATE_SUB(NOW(), INTERVAL 10 DAY),  '上海安捷电梯维保有限公司', 'REPAIRING', NULL, NULL,       3, NOW()),
+    (30, 'EL-2013-030', 13, 9,  '迅达',   'Schindler 5400', 1000, 1.75,  6, '2013-12-01', '2025-12-01', DATE_ADD(NOW(), INTERVAL 260 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         4, NOW()),
+    (31, 'EL-2013-031', 13, 9,  '迅达',   'Schindler 5400', 1000, 1.75,  6, '2013-12-01', '2025-12-01', DATE_ADD(NOW(), INTERVAL 260 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         2, NOW()),
+    (32, 'EL-1998-032', 14, 10, '三菱',   'GPS-II 500',      500, 1.00,  5, '1998-08-08', '2025-08-08', DATE_ADD(NOW(), INTERVAL 15 DAY),  '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         3, NOW()),
+    (33, 'EL-2020-033', 15, 11, '蒂升',   'TWIN 2000',      2000, 2.50,  4, '2020-10-01', '2025-10-01', DATE_ADD(NOW(), INTERVAL 350 DAY), '上海安捷电梯维保有限公司', 'RUNNING', NULL, NULL,         1, NOW()),
+    (34, 'EL-2020-034', 15, 11, '蒂升',   'TWIN 2000',      2000, 2.50,  4, '2020-10-01', '2025-10-01', DATE_SUB(NOW(), INTERVAL 25 DAY),  '上海安捷电梯维保有限公司', 'INSPECTING', NULL, NULL,      2, NOW()),
+    (35, 'EL-2006-035', 16, 12, '通力',   'MonoSpace 800',   800, 1.75, 26, '2006-02-14', '2024-02-14', DATE_SUB(NOW(), INTERVAL 200 DAY), '上海安捷电梯维保有限公司', 'OUT_OF_SERVICE', NULL, NULL,  1, NOW());
 
 -- 计划执行日刻意落在最近 12 个月内，甘特条全部可见
 INSERT INTO maintenance_plan (id, plan_no, elevator_id, unit_id, building_id, cycle, plan_date, team, worker, status, remark, updated_at) VALUES
@@ -309,50 +372,91 @@ INSERT INTO maintenance_plan (id, plan_no, elevator_id, unit_id, building_id, cy
     (27, 'MP-2026-0027', 27, 12, 8,  'HALF_MONTH', DATE_SUB(NOW(), INTERVAL 11 DAY),   '维保三组', '周海涛', 'DONE',    '医用梯半月保养', NOW()),
     (28, 'MP-2026-0028', 30, 13, 9,  'QUARTER',    DATE_ADD(NOW(), INTERVAL 20 DAY),   '维保二组', '孙立勇', 'PENDING', '商场梯季度检查', NOW());
 
-INSERT INTO maintenance_order (id, order_no, plan_id, elevator_id, unit_id, building_id, cycle, plan_date, team, worker, execute_result, actual_date, status, remark, updated_at) VALUES
-    (1,  'MO-2026-0001', 1,  1,  1,  1,  'HALF_MONTH', DATE_SUB(NOW(), INTERVAL 11 MONTH), '维保一组', '刘志强', '导轨润滑、层门检查合格', DATE_SUB(NOW(), INTERVAL 11 MONTH), 'DONE',    '', NOW()),
-    (2,  'MO-2026-0002', 2,  1,  1,  1,  'MONTH',      DATE_SUB(NOW(), INTERVAL 10 MONTH), '维保一组', '刘志强', '限速器、安全钳检查合格', DATE_SUB(NOW(), INTERVAL 10 MONTH), 'DONE',    '', NOW()),
-    (3,  'MO-2026-0003', 3,  1,  1,  1,  'QUARTER',    DATE_SUB(NOW(), INTERVAL 9 MONTH),  '维保一组', '刘志强', '季度检查合格，轿厢照明更换', DATE_SUB(NOW(), INTERVAL 9 MONTH), 'DONE',    '', NOW()),
-    (4,  'MO-2026-0004', 4,  1,  1,  1,  'HALF_YEAR',  DATE_SUB(NOW(), INTERVAL 8 MONTH),  '维保二组', '孙立勇', '半年检合格，更换门刀滑块', DATE_SUB(NOW(), INTERVAL 8 MONTH), 'DONE',    '', NOW()),
-    (5,  'MO-2026-0005', 5,  1,  1,  1,  'MONTH',      DATE_SUB(NOW(), INTERVAL 7 MONTH),  '维保一组', '刘志强', '例行保养合格', DATE_SUB(NOW(), INTERVAL 7 MONTH), 'DONE',    '', NOW()),
-    (6,  'MO-2026-0006', 6,  1,  1,  1,  'HALF_MONTH', DATE_SUB(NOW(), INTERVAL 6 MONTH),  '维保一组', '刘志强', '例行保养合格', DATE_SUB(NOW(), INTERVAL 6 MONTH), 'DONE',    '', NOW()),
-    (7,  'MO-2026-0007', 7,  1,  1,  1,  'QUARTER',    DATE_SUB(NOW(), INTERVAL 5 MONTH),  '维保二组', '孙立勇', '季度检查合格', DATE_SUB(NOW(), INTERVAL 5 MONTH), 'DONE',    '', NOW()),
-    (8,  'MO-2026-0008', 8,  1,  1,  1,  'MONTH',      DATE_SUB(NOW(), INTERVAL 4 MONTH),  '维保一组', '刘志强', '例行保养合格', DATE_SUB(NOW(), INTERVAL 4 MONTH), 'DONE',    '', NOW()),
-    (9,  'MO-2026-0009', 9,  1,  1,  1,  'HALF_MONTH', DATE_SUB(NOW(), INTERVAL 3 MONTH),  '维保一组', '刘志强', '例行保养合格', DATE_SUB(NOW(), INTERVAL 3 MONTH), 'DONE',    '', NOW()),
-    (10, 'MO-2026-0010', 10, 1,  1,  1,  'YEAR',       DATE_SUB(NOW(), INTERVAL 2 MONTH),  '维保三组', '周海涛', '年度自检完成，制动试验合格', DATE_SUB(NOW(), INTERVAL 2 MONTH), 'DONE',    '', NOW()),
-    (11, 'MO-2026-0011', 11, 1,  1,  1,  'MONTH',      DATE_SUB(NOW(), INTERVAL 1 MONTH),  '维保一组', '刘志强', '例行保养合格', DATE_SUB(NOW(), INTERVAL 1 MONTH), 'DONE',    '', NOW()),
-    (12, 'MO-2026-0012', 12, 1,  1,  1,  'HALF_MONTH', DATE_SUB(NOW(), INTERVAL 12 DAY),   '维保一组', '刘志强', '例行保养合格，厅门地坎清理', DATE_SUB(NOW(), INTERVAL 12 DAY), 'DONE',    '', NOW()),
-    (13, 'MO-2026-0013', NULL, 3,  1,  1,  'MONTH',      DATE_ADD(NOW(), INTERVAL 3 DAY),   '维保二组', '孙立勇', NULL, NULL, 'PENDING', '临时派工：曳引机异响复检', NOW()),
-    (14, 'MO-2026-0014', NULL, 6,  3,  2,  'MONTH',      DATE_ADD(NOW(), INTERVAL 6 DAY),   '维保二组', '孙立勇', NULL, NULL, 'PENDING', '临时派工：季度复检', NOW()),
-    (15, 'MO-2026-0015', 19, 6,  3,  2,  'MONTH',      DATE_SUB(NOW(), INTERVAL 18 DAY),   '维保二组', '孙立勇', '例行保养合格', DATE_SUB(NOW(), INTERVAL 18 DAY), 'DONE',    '', NOW()),
-    (16, 'MO-2026-0016', 21, 8,  3,  2,  'YEAR',       DATE_SUB(NOW(), INTERVAL 6 DAY),    '维保三组', '周海涛', '年检配合完成', DATE_SUB(NOW(), INTERVAL 6 DAY), 'DONE',    '', NOW()),
-    (17, 'MO-2026-0017', 22, 11, 5,  3,  'MONTH',      DATE_SUB(NOW(), INTERVAL 22 DAY),   '维保三组', '周海涛', '例行保养合格', DATE_SUB(NOW(), INTERVAL 22 DAY), 'DONE',    '', NOW()),
-    (18, 'MO-2026-0018', 24, 15, 6,  3,  'MONTH',      DATE_SUB(NOW(), INTERVAL 9 DAY),    '维保一组', '刘志强', '例行保养合格', DATE_SUB(NOW(), INTERVAL 9 DAY), 'DONE',    '', NOW()),
-    (19, 'MO-2026-0019', NULL, 14, 5,  3,  'MONTH',      DATE_SUB(NOW(), INTERVAL 4 DAY),   '维保三组', '周海涛', NULL, NULL, 'DELAYED', '缺件，等钢丝绳到货', NOW()),
-    (20, 'MO-2026-0020', 26, 20, 8,  5,  'MONTH',      DATE_SUB(NOW(), INTERVAL 30 DAY),   '维保一组', '刘志强', NULL, NULL, 'DELAYED', '业主装修延期', NOW()),
-    (21, 'MO-2026-0021', NULL, 29, 12, 8, 'MONTH',      DATE_ADD(NOW(), INTERVAL 2 DAY),    '维保三组', '周海涛', NULL, NULL, 'PENDING', '医用梯优先派工', NOW()),
-    (22, 'MO-2026-0022', 27, 27, 12, 8, 'HALF_MONTH', DATE_SUB(NOW(), INTERVAL 11 DAY),   '维保三组', '周海涛', '半月保养合格', DATE_SUB(NOW(), INTERVAL 11 DAY), 'DONE',    '', NOW()),
-    (23, 'MO-2026-0023', NULL, 33, 15, 11, 'QUARTER',   DATE_ADD(NOW(), INTERVAL 9 DAY),   '维保二组', '孙立勇', NULL, NULL, 'PENDING', '会展前季度检查', NOW()),
-    (24, 'MO-2026-0024', NULL, 32, 14, 10, 'MONTH',     DATE_SUB(NOW(), INTERVAL 15 DAY),  '维保一组', '刘志强', NULL, NULL, 'VOID',    '重复开单，作废', NOW());
+-- [应急] 电梯 13/14 被 FR-2026-0007/0008 受理占用：未完成计划保留但置 SUSPENDED，标出占用原因
+INSERT INTO maintenance_plan
+    (id, plan_no, elevator_id, unit_id, building_id, cycle, plan_date, team, worker, status, occupied_by_fault_id, occupied_reason, prev_status, remark, updated_at) VALUES
+    (29, 'MP-2026-0029', 13, 5, 3, 'HALF_MONTH', DATE_ADD(NOW(), INTERVAL 2 DAY),  '维保三组', '周海涛', 'SUSPENDED', 7,
+     '应急抢修 FR-2026-0007（抢修工单 EX-2026-0001）占用电梯，计划暂停；闭环后自动恢复', 'PENDING', '半月保养，被应急占用暂停', NOW()),
+    (30, 'MP-2026-0030', 14, 5, 3, 'QUARTER',    DATE_ADD(NOW(), INTERVAL 10 DAY), '维保三组', '周海涛', 'SUSPENDED', 8,
+     '应急抢修 FR-2026-0008（抢修工单 EX-2026-0002）占用电梯，计划暂停；闭环后自动恢复', 'DELAYED', '季度检查已延期一次，再被应急占用暂停', NOW());
+
+INSERT INTO maintenance_order (id, order_no, plan_id, elevator_id, unit_id, building_id, order_kind, cycle, plan_date, team, worker, execute_result, actual_date, status, remark, updated_at) VALUES
+    (1,  'MO-2026-0001', 1,  1,  1,  1,  'NORMAL', 'HALF_MONTH', DATE_SUB(NOW(), INTERVAL 11 MONTH), '维保一组', '刘志强', '导轨润滑、层门检查合格', DATE_SUB(NOW(), INTERVAL 11 MONTH), 'DONE',    '', NOW()),
+    (2,  'MO-2026-0002', 2,  1,  1,  1,  'NORMAL', 'MONTH',      DATE_SUB(NOW(), INTERVAL 10 MONTH), '维保一组', '刘志强', '限速器、安全钳检查合格', DATE_SUB(NOW(), INTERVAL 10 MONTH), 'DONE',    '', NOW()),
+    (3,  'MO-2026-0003', 3,  1,  1,  1,  'NORMAL', 'QUARTER',    DATE_SUB(NOW(), INTERVAL 9 MONTH),  '维保一组', '刘志强', '季度检查合格，轿厢照明更换', DATE_SUB(NOW(), INTERVAL 9 MONTH), 'DONE',    '', NOW()),
+    (4,  'MO-2026-0004', 4,  1,  1,  1,  'NORMAL', 'HALF_YEAR',  DATE_SUB(NOW(), INTERVAL 8 MONTH),  '维保二组', '孙立勇', '半年检合格，更换门刀滑块', DATE_SUB(NOW(), INTERVAL 8 MONTH), 'DONE',    '', NOW()),
+    (5,  'MO-2026-0005', 5,  1,  1,  1,  'NORMAL', 'MONTH',      DATE_SUB(NOW(), INTERVAL 7 MONTH),  '维保一组', '刘志强', '例行保养合格', DATE_SUB(NOW(), INTERVAL 7 MONTH), 'DONE',    '', NOW()),
+    (6,  'MO-2026-0006', 6,  1,  1,  1,  'NORMAL', 'HALF_MONTH', DATE_SUB(NOW(), INTERVAL 6 MONTH),  '维保一组', '刘志强', '例行保养合格', DATE_SUB(NOW(), INTERVAL 6 MONTH), 'DONE',    '', NOW()),
+    (7,  'MO-2026-0007', 7,  1,  1,  1,  'NORMAL', 'QUARTER',    DATE_SUB(NOW(), INTERVAL 5 MONTH),  '维保二组', '孙立勇', '季度检查合格', DATE_SUB(NOW(), INTERVAL 5 MONTH), 'DONE',    '', NOW()),
+    (8,  'MO-2026-0008', 8,  1,  1,  1,  'NORMAL', 'MONTH',      DATE_SUB(NOW(), INTERVAL 4 MONTH),  '维保一组', '刘志强', '例行保养合格', DATE_SUB(NOW(), INTERVAL 4 MONTH), 'DONE',    '', NOW()),
+    (9,  'MO-2026-0009', 9,  1,  1,  1,  'NORMAL', 'HALF_MONTH', DATE_SUB(NOW(), INTERVAL 3 MONTH),  '维保一组', '刘志强', '例行保养合格', DATE_SUB(NOW(), INTERVAL 3 MONTH), 'DONE',    '', NOW()),
+    (10, 'MO-2026-0010', 10, 1,  1,  1,  'NORMAL', 'YEAR',       DATE_SUB(NOW(), INTERVAL 2 MONTH),  '维保三组', '周海涛', '年度自检完成，制动试验合格', DATE_SUB(NOW(), INTERVAL 2 MONTH), 'DONE',    '', NOW()),
+    (11, 'MO-2026-0011', 11, 1,  1,  1,  'NORMAL', 'MONTH',      DATE_SUB(NOW(), INTERVAL 1 MONTH),  '维保一组', '刘志强', '例行保养合格', DATE_SUB(NOW(), INTERVAL 1 MONTH), 'DONE',    '', NOW()),
+    (12, 'MO-2026-0012', 12, 1,  1,  1,  'NORMAL', 'HALF_MONTH', DATE_SUB(NOW(), INTERVAL 12 DAY),   '维保一组', '刘志强', '例行保养合格，厅门地坎清理', DATE_SUB(NOW(), INTERVAL 12 DAY), 'DONE',    '', NOW()),
+    (13, 'MO-2026-0013', NULL, 3,  1,  1,  'NORMAL', 'MONTH',      DATE_ADD(NOW(), INTERVAL 3 DAY),   '维保二组', '孙立勇', NULL, NULL, 'PENDING', '临时派工：曳引机异响复检', NOW()),
+    (14, 'MO-2026-0014', NULL, 6,  3,  2,  'NORMAL', 'MONTH',      DATE_ADD(NOW(), INTERVAL 6 DAY),   '维保二组', '孙立勇', NULL, NULL, 'PENDING', '临时派工：季度复检', NOW()),
+    (15, 'MO-2026-0015', 19, 6,  3,  2,  'NORMAL', 'MONTH',      DATE_SUB(NOW(), INTERVAL 18 DAY),   '维保二组', '孙立勇', '例行保养合格', DATE_SUB(NOW(), INTERVAL 18 DAY), 'DONE',    '', NOW()),
+    (16, 'MO-2026-0016', 21, 8,  3,  2,  'NORMAL', 'YEAR',       DATE_SUB(NOW(), INTERVAL 6 DAY),    '维保三组', '周海涛', '年检配合完成', DATE_SUB(NOW(), INTERVAL 6 DAY), 'DONE',    '', NOW()),
+    (17, 'MO-2026-0017', 22, 11, 5,  3,  'NORMAL', 'MONTH',      DATE_SUB(NOW(), INTERVAL 22 DAY),   '维保三组', '周海涛', '例行保养合格', DATE_SUB(NOW(), INTERVAL 22 DAY), 'DONE',    '', NOW()),
+    (18, 'MO-2026-0018', 24, 15, 6,  3,  'NORMAL', 'MONTH',      DATE_SUB(NOW(), INTERVAL 9 DAY),    '维保一组', '刘志强', '例行保养合格', DATE_SUB(NOW(), INTERVAL 9 DAY), 'DONE',    '', NOW()),
+    (19, 'MO-2026-0019', NULL, 14, 5,  3,  'NORMAL', 'MONTH',      DATE_SUB(NOW(), INTERVAL 4 DAY),   '维保三组', '周海涛', NULL, NULL, 'DELAYED', '缺件，等钢丝绳到货（后被应急占用暂停，见 MP/EX 单）', NOW()),
+    (20, 'MO-2026-0020', 26, 20, 8,  5,  'NORMAL', 'MONTH',      DATE_SUB(NOW(), INTERVAL 30 DAY),   '维保一组', '刘志强', NULL, NULL, 'DELAYED', '业主装修延期', NOW()),
+    (21, 'MO-2026-0021', NULL, 29, 12, 8, 'NORMAL', 'MONTH',      DATE_ADD(NOW(), INTERVAL 2 DAY),    '维保三组', '周海涛', NULL, NULL, 'PENDING', '医用梯优先派工', NOW()),
+    (22, 'MO-2026-0022', 27, 27, 12, 8, 'NORMAL', 'HALF_MONTH', DATE_SUB(NOW(), INTERVAL 11 DAY),   '维保三组', '周海涛', '半月保养合格', DATE_SUB(NOW(), INTERVAL 11 DAY), 'DONE',    '', NOW()),
+    (23, 'MO-2026-0023', NULL, 33, 15, 11, 'NORMAL', 'QUARTER',  DATE_ADD(NOW(), INTERVAL 9 DAY),   '维保二组', '孙立勇', NULL, NULL, 'PENDING', '会展前季度检查', NOW()),
+    (24, 'MO-2026-0024', NULL, 32, 14, 10, 'NORMAL', 'MONTH',     DATE_SUB(NOW(), INTERVAL 15 DAY),  '维保一组', '刘志强', NULL, NULL, 'VOID',    '重复开单，作废', NOW());
+
+-- [应急联动] 抢修工单：EX-2026-0001/0002 与未闭环的 FR-2026-0007/0008 一一对应（处理中）；
+-- EX-2026-0003/0004/0005 为历史已闭环应急抢修单，证明故障/工单/电梯三处单号一致
+INSERT INTO maintenance_order
+    (id, order_no, plan_id, elevator_id, unit_id, building_id, order_kind, cycle, plan_date, team, worker, execute_result, actual_date, status, fault_id, fault_no, arrive_time, remark, updated_at) VALUES
+    (25, 'EX-2026-0001', NULL, 13, 5, 3, 'EMERGENCY', NULL, CURDATE(), '应急抢修组', '周海涛', NULL, NULL, 'PROCESSING',
+     7, 'FR-2026-0007', DATE_ADD(DATE_SUB(NOW(), INTERVAL 1 DAY), INTERVAL 58 MINUTE), '应急抢修：困人，已到场放人，抢修中', NOW()),
+    (26, 'EX-2026-0002', NULL, 14, 5, 3, 'EMERGENCY', NULL, CURDATE(), '应急抢修组', '周海涛', NULL, NULL, 'PROCESSING',
+     8, 'FR-2026-0008', DATE_ADD(DATE_SUB(NOW(), INTERVAL 12 HOUR), INTERVAL 42 MINUTE), '应急抢修：停梯，已到场，抢修中', NOW()),
+    (27, 'EX-2026-0003', NULL, 1, 1, 1, 'EMERGENCY', NULL, DATE_SUB(NOW(), INTERVAL 41 DAY), '应急抢修组', '孙立勇', '现场放人，检查门锁回路', DATE_SUB(NOW(), INTERVAL 41 DAY), 'FIXED',
+     2, 'FR-2026-0002', DATE_ADD(DATE_SUB(NOW(), INTERVAL 41 DAY), INTERVAL 26 MINUTE), '应急抢修：困人，已闭环', NOW()),
+    (28, 'EX-2026-0004', NULL, 8, 3, 2, 'EMERGENCY', NULL, DATE_SUB(NOW(), INTERVAL 5 DAY), '应急抢修组', '周海涛', '变频器故障，更换控制板', DATE_SUB(NOW(), INTERVAL 5 DAY), 'FIXED',
+     5, 'FR-2026-0005', DATE_ADD(DATE_SUB(NOW(), INTERVAL 5 DAY), INTERVAL 21 MINUTE), '应急抢修：停梯，已闭环', NOW()),
+    (29, 'EX-2026-0005', NULL, 33, 15, 11, 'EMERGENCY', NULL, DATE_SUB(NOW(), INTERVAL 25 DAY), '应急抢修组', '孙立勇', '安全回路恢复', DATE_SUB(NOW(), INTERVAL 25 DAY), 'FIXED',
+     16, 'FR-2026-0016', DATE_ADD(DATE_SUB(NOW(), INTERVAL 25 DAY), INTERVAL 49 MINUTE), '应急抢修：停梯，已闭环', NOW());
 
 -- [R4.2] FR-2026-0002 / FR-2026-0007 困人；[R4.3] 0007 到达 46 分钟超红线
-INSERT INTO fault_report (id, fault_no, elevator_id, unit_id, building_id, fault_type, report_time, response_minutes, arrive_minutes, fix_time, trapped, handle_result, reporter, status, updated_at) VALUES
-    (1,  'FR-2026-0001', 1,  1,  1,  'NOISE',    DATE_SUB(NOW(), INTERVAL 62 DAY), 6,  28, DATE_SUB(NOW(), INTERVAL 62 DAY),  0, '导轨支架紧固，异响消除', '物业周敏', 'FIXED',      NOW()),
-    (2,  'FR-2026-0002', 1,  1,  1,  'TRAPPED',  DATE_SUB(NOW(), INTERVAL 41 DAY), 4,  22, DATE_SUB(NOW(), INTERVAL 41 DAY),  1, '现场放人，检查门锁回路', '乘客王女士', 'FIXED',     NOW()),
-    (3,  'FR-2026-0003', 3,  1,  1,  'LEVELING', DATE_SUB(NOW(), INTERVAL 15 DAY), 8,  35, NULL,                             0, NULL, '物业周敏', 'PROCESSING', NOW()),
-    (4,  'FR-2026-0004', 6,  3,  2,  'DOOR',     DATE_SUB(NOW(), INTERVAL 9 DAY),  5,  26, DATE_SUB(NOW(), INTERVAL 9 DAY),   0, '门刀滑块磨损，已更换', '物业陈立', 'FIXED',      NOW()),
-    (5,  'FR-2026-0005', 8,  3,  2,  'STOPPED',  DATE_SUB(NOW(), INTERVAL 5 DAY),  3,  18, DATE_SUB(NOW(), INTERVAL 5 DAY),   1, '变频器故障，更换控制板', '物业陈立', 'FIXED',     NOW()),
-    (6,  'FR-2026-0006', 11, 5,  3,  'NOISE',    DATE_SUB(NOW(), INTERVAL 2 DAY),  7,  24, NULL,                             0, NULL, '物业陈立', 'PENDING',   NOW()),
-    (7,  'FR-2026-0007', 13, 5,  3,  'TRAPPED',  DATE_SUB(NOW(), INTERVAL  1 DAY), 12, 46, NULL,                             1, NULL, '乘客李先生', 'PROCESSING', NOW()),
-    (8,  'FR-2026-0008', 14, 5,  3,  'STOPPED',  DATE_SUB(NOW(), INTERVAL 12 HOUR), 9, 33, NULL,                             1, NULL, '物业陈立', 'PROCESSING', NOW()),
-    (9,  'FR-2026-0009', 15, 6,  3,  'LEVELING', DATE_SUB(NOW(), INTERVAL 30 DAY), 6,  29, DATE_SUB(NOW(), INTERVAL 30 DAY),  0, '平层感应器调整', '物业陈立', 'FIXED',      NOW()),
-    (10, 'FR-2026-0010', 18, 7,  4,  'OTHER',    DATE_SUB(NOW(), INTERVAL 8 DAY),  10, 40, DATE_SUB(NOW(), INTERVAL 8 DAY),   0, '轿厢照明更换', '物业陈立', 'FIXED',      NOW()),
-    (11, 'FR-2026-0011', 20, 8,  5,  'DOOR',     DATE_SUB(NOW(), INTERVAL 3 DAY),  6,  31, NULL,                             0, NULL, '物业王芳', 'PENDING',   NOW()),
-    (12, 'FR-2026-0012', 22, 9,  5,  'NOISE',    DATE_SUB(NOW(), INTERVAL 21 DAY), 5,  27, DATE_SUB(NOW(), INTERVAL 21 DAY),  0, '门机皮带张紧', '物业王芳', 'FIXED',      NOW()),
-    (13, 'FR-2026-0013', 27, 12, 8,  'TRAPPED',  DATE_SUB(NOW(), INTERVAL 6 HOUR), 4,  19, NULL,                             1, NULL, '医护站', 'PENDING',   NOW()),
-    (14, 'FR-2026-0014', 30, 13, 9,  'DOOR',     DATE_SUB(NOW(), INTERVAL 17 DAY), 7,  25, DATE_SUB(NOW(), INTERVAL 17 DAY),  0, '光幕接线恢复', '商场孙浩', 'FIXED',      NOW()),
-    (15, 'FR-2026-0015', 31, 13, 9,  'LEVELING', DATE_SUB(NOW(), INTERVAL 4 DAY),  8,  30, NULL,                             0, NULL, '商场孙浩', 'PROCESSING', NOW()),
-    (16, 'FR-2026-0016', 33, 15, 11, 'STOPPED',  DATE_SUB(NOW(), INTERVAL 25 DAY), 11, 38, DATE_SUB(NOW(), INTERVAL 25 DAY),  1, '安全回路恢复', '会展郑楠', 'FIXED',      NOW());
+-- [应急] 困人/停梯 emergency=1：0007/0008 已受理（抢修中，关联 EX-2026-0001/0002，电梯应急维修），
+--        0013 待受理；0002/0005/0016 为历史已闭环应急单。普通异响等 emergency=0 走原流程。
+INSERT INTO fault_report
+    (id, fault_no, elevator_id, unit_id, building_id, fault_type, emergency, risk_level,
+     report_time, accept_time, assignee, response_minutes, arrive_minutes, arrive_time, fix_time,
+     trapped, handle_result, cancel_reason, reporter, order_id, order_no, confirm_user, status, stage, updated_at) VALUES
+    (1,  'FR-2026-0001', 1,  1,  1,  'NOISE',    0, 'NORMAL', DATE_SUB(NOW(), INTERVAL 62 DAY), NULL, NULL, 6,  28, NULL, DATE_SUB(NOW(), INTERVAL 62 DAY), 0, '导轨支架紧固，异响消除', NULL, '物业周敏', NULL, NULL, NULL, 'FIXED', '已修复', NOW()),
+    (2,  'FR-2026-0002', 1,  1,  1,  'TRAPPED',  1, 'HIGH',   DATE_SUB(NOW(), INTERVAL 41 DAY), DATE_ADD(DATE_SUB(NOW(), INTERVAL 41 DAY), INTERVAL 4 MINUTE), '孙立勇', 4, 22, DATE_ADD(DATE_SUB(NOW(), INTERVAL 41 DAY), INTERVAL 26 MINUTE), DATE_SUB(NOW(), INTERVAL 41 DAY), 1, '现场放人，检查门锁回路', NULL, '乘客王女士', 27, 'EX-2026-0003', '值班经理', 'FIXED', '已修复', NOW()),
+    (3,  'FR-2026-0003', 3,  1,  1,  'LEVELING', 0, 'NORMAL', DATE_SUB(NOW(), INTERVAL 15 DAY), NULL, NULL, 8,  35, NULL, NULL, 0, NULL, NULL, '物业周敏', NULL, NULL, NULL, 'PROCESSING', '处理中', NOW()),
+    (4,  'FR-2026-0004', 6,  3,  2,  'DOOR',     0, 'NORMAL', DATE_SUB(NOW(), INTERVAL 9 DAY),  NULL, NULL, 5,  26, NULL, DATE_SUB(NOW(), INTERVAL 9 DAY), 0, '门刀滑块磨损，已更换', NULL, '物业陈立', NULL, NULL, NULL, 'FIXED', '已修复', NOW()),
+    (5,  'FR-2026-0005', 8,  3,  2,  'STOPPED',  1, 'HIGH',   DATE_SUB(NOW(), INTERVAL 5 DAY),  DATE_ADD(DATE_SUB(NOW(), INTERVAL 5 DAY), INTERVAL 3 MINUTE), '周海涛', 3, 18, DATE_ADD(DATE_SUB(NOW(), INTERVAL 5 DAY), INTERVAL 21 MINUTE), DATE_SUB(NOW(), INTERVAL 5 DAY), 1, '变频器故障，更换控制板', NULL, '物业陈立', 28, 'EX-2026-0004', '值班经理', 'FIXED', '已修复', NOW()),
+    (6,  'FR-2026-0006', 11, 5,  3,  'NOISE',    0, 'NORMAL', DATE_SUB(NOW(), INTERVAL 2 DAY),  NULL, NULL, 7,  24, NULL, NULL, 0, NULL, NULL, '物业陈立', NULL, NULL, NULL, 'PENDING', '待处理', NOW()),
+    (7,  'FR-2026-0007', 13, 5,  3,  'TRAPPED',  1, 'HIGH',   DATE_SUB(NOW(), INTERVAL 1 DAY),  DATE_ADD(DATE_SUB(NOW(), INTERVAL 1 DAY), INTERVAL 12 MINUTE), '周海涛', 12, 46, DATE_ADD(DATE_SUB(NOW(), INTERVAL 1 DAY), INTERVAL 58 MINUTE), NULL, 1, NULL, NULL, '乘客李先生', 25, 'EX-2026-0001', NULL, 'PROCESSING', '抢修中', NOW()),
+    (8,  'FR-2026-0008', 14, 5,  3,  'STOPPED',  1, 'HIGH',   DATE_SUB(NOW(), INTERVAL 12 HOUR), DATE_ADD(DATE_SUB(NOW(), INTERVAL 12 HOUR), INTERVAL 9 MINUTE), '周海涛', 9, 33, DATE_ADD(DATE_SUB(NOW(), INTERVAL 12 HOUR), INTERVAL 42 MINUTE), NULL, 1, NULL, NULL, '物业陈立', 26, 'EX-2026-0002', NULL, 'PROCESSING', '抢修中', NOW()),
+    (9,  'FR-2026-0009', 15, 6,  3,  'LEVELING', 0, 'NORMAL', DATE_SUB(NOW(), INTERVAL 30 DAY), NULL, NULL, 6,  29, NULL, DATE_SUB(NOW(), INTERVAL 30 DAY), 0, '平层感应器调整', NULL, '物业陈立', NULL, NULL, NULL, 'FIXED', '已修复', NOW()),
+    (10, 'FR-2026-0010', 18, 7,  4,  'OTHER',    0, 'NORMAL', DATE_SUB(NOW(), INTERVAL 8 DAY),  NULL, NULL, 10, 40, NULL, DATE_SUB(NOW(), INTERVAL 8 DAY), 0, '轿厢照明更换', NULL, '物业陈立', NULL, NULL, NULL, 'FIXED', '已修复', NOW()),
+    (11, 'FR-2026-0011', 20, 8,  5,  'DOOR',     0, 'NORMAL', DATE_SUB(NOW(), INTERVAL 3 DAY),  NULL, NULL, 6,  31, NULL, NULL, 0, NULL, NULL, '物业王芳', NULL, NULL, NULL, 'PENDING', '待处理', NOW()),
+    (12, 'FR-2026-0012', 22, 9,  5,  'NOISE',    0, 'NORMAL', DATE_SUB(NOW(), INTERVAL 21 DAY), NULL, NULL, 5,  27, NULL, DATE_SUB(NOW(), INTERVAL 21 DAY), 0, '门机皮带张紧', NULL, '物业王芳', NULL, NULL, NULL, 'FIXED', '已修复', NOW()),
+    (13, 'FR-2026-0013', 27, 12, 8,  'TRAPPED',  1, 'HIGH',   DATE_SUB(NOW(), INTERVAL 6 HOUR), NULL, NULL, 4,  19, NULL, NULL, 1, NULL, NULL, '医护站', NULL, NULL, NULL, 'PENDING', '待受理', NOW()),
+    (14, 'FR-2026-0014', 30, 13, 9,  'DOOR',     0, 'NORMAL', DATE_SUB(NOW(), INTERVAL 17 DAY), NULL, NULL, 7,  25, NULL, DATE_SUB(NOW(), INTERVAL 17 DAY), 0, '光幕接线恢复', NULL, '商场孙浩', NULL, NULL, NULL, 'FIXED', '已修复', NOW()),
+    (15, 'FR-2026-0015', 31, 13, 9,  'LEVELING', 0, 'NORMAL', DATE_SUB(NOW(), INTERVAL 4 DAY),  NULL, NULL, 8,  30, NULL, NULL, 0, NULL, NULL, '商场孙浩', NULL, NULL, NULL, 'PROCESSING', '处理中', NOW()),
+    (16, 'FR-2026-0016', 33, 15, 11, 'STOPPED',  1, 'HIGH',   DATE_SUB(NOW(), INTERVAL 25 DAY), DATE_ADD(DATE_SUB(NOW(), INTERVAL 25 DAY), INTERVAL 11 MINUTE), '孙立勇', 11, 38, DATE_ADD(DATE_SUB(NOW(), INTERVAL 25 DAY), INTERVAL 49 MINUTE), DATE_SUB(NOW(), INTERVAL 25 DAY), 1, '安全回路恢复', NULL, '会展郑楠', 29, 'EX-2026-0005', '值班经理', 'FIXED', '已修复', NOW());
+
+-- [应急] 当前有效的电梯占用锁：电梯 13/14 各一行，与 FR/EX/电梯台账三方一致
+INSERT INTO elevator_emergency_lock (id, elevator_id, fault_id, fault_no, order_id, order_no, locked_by, created_at) VALUES
+    (1, 13, 7, 'FR-2026-0007', 25, 'EX-2026-0001', '值班员', DATE_ADD(DATE_SUB(NOW(), INTERVAL 1 DAY), INTERVAL 12 MINUTE)),
+    (2, 14, 8, 'FR-2026-0008', 26, 'EX-2026-0002', '值班员', DATE_ADD(DATE_SUB(NOW(), INTERVAL 12 HOUR), INTERVAL 9 MINUTE));
+
+-- [应急] 未闭环应急报修的操作记录（只追加；服务重启后仍可追溯）
+INSERT INTO fault_operation_log (id, fault_id, fault_no, action, from_status, to_status, operator, detail, order_id, order_no, created_at) VALUES
+    (1, 7, 'FR-2026-0007', 'CREATE', NULL,       'PENDING',    '报修登记', '登记应急故障（困人/停梯），进入应急态', NULL, NULL, DATE_SUB(NOW(), INTERVAL 1 DAY)),
+    (2, 7, 'FR-2026-0007', 'ACCEPT', 'PENDING',  'PROCESSING', '值班员', '受理应急报修，生成抢修工单 EX-2026-0001，电梯进入应急维修，暂停在途计划', 25, 'EX-2026-0001', DATE_ADD(DATE_SUB(NOW(), INTERVAL 1 DAY), INTERVAL 12 MINUTE)),
+    (3, 8, 'FR-2026-0008', 'CREATE', NULL,       'PENDING',    '报修登记', '登记应急故障（困人/停梯），进入应急态', NULL, NULL, DATE_SUB(NOW(), INTERVAL 12 HOUR)),
+    (4, 8, 'FR-2026-0008', 'ACCEPT', 'PENDING',  'PROCESSING', '值班员', '受理应急报修，生成抢修工单 EX-2026-0002，电梯进入应急维修，暂停在途计划', 26, 'EX-2026-0002', DATE_ADD(DATE_SUB(NOW(), INTERVAL 12 HOUR), INTERVAL 9 MINUTE)),
+    (5, 13, 'FR-2026-0013', 'CREATE', NULL,      'PENDING',    '报修登记', '登记应急故障（困人/停梯），进入应急态，等待受理', NULL, NULL, DATE_SUB(NOW(), INTERVAL 6 HOUR));
 
 -- [R5.1] amount = quantity × unit_price；[R5.2] ref_type = ORDER / FAULT
 INSERT INTO part_replacement (id, elevator_id, unit_id, building_id, part_name, spec, quantity, unit_price, amount, replace_date, operator, ref_type, ref_id, ref_no, supplier, status, updated_at) VALUES

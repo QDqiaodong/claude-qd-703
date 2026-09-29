@@ -108,6 +108,10 @@ public class MaintenanceService {
         if (ElevatorDict.P_VOID.equals(plan.getStatus())) {
             throw new BizException("计划 " + plan.getPlanNo() + " 已作废，不能再执行");
         }
+        if (ElevatorDict.P_SUSPENDED.equals(plan.getStatus())) {
+            throw new BizException("计划 " + plan.getPlanNo() + " 已被应急处置暂停（" + plan.getOccupiedReason()
+                    + "），需等应急闭环自动恢复后再执行");
+        }
         if (ElevatorDict.P_DONE.equals(plan.getStatus())) {
             throw new BizException("计划 " + plan.getPlanNo() + " 已执行，不要重复执行");
         }
@@ -115,6 +119,7 @@ public class MaintenanceService {
                 && plan.getPlanDate().isAfter(LocalDate.now())) {
             throw new BizException("计划已延期到 " + plan.getPlanDate() + "，未到执行日");
         }
+        elevatorRepository.findById(plan.getElevatorId()).ifPresent(this::checkElevatorUsable);
         String result = req == null ? null : trim(req.getExecuteResult());
         if (result == null || result.isEmpty()) {
             throw new BizException("执行结果不能为空");
@@ -132,6 +137,7 @@ public class MaintenanceService {
         order.setElevatorId(plan.getElevatorId());
         order.setUnitId(plan.getUnitId());
         order.setBuildingId(plan.getBuildingId());
+        order.setOrderKind(ElevatorDict.KIND_NORMAL);
         order.setCycle(plan.getCycle());
         order.setPlanDate(plan.getPlanDate());
         order.setTeam(plan.getTeam());
@@ -150,6 +156,9 @@ public class MaintenanceService {
         MaintenancePlan plan = planRepository.findById(id).orElseThrow(() -> new BizException("维保计划不存在：id=" + id));
         if (ElevatorDict.P_VOID.equals(plan.getStatus())) {
             throw new BizException("已作废的计划不能再延期");
+        }
+        if (ElevatorDict.P_SUSPENDED.equals(plan.getStatus())) {
+            throw new BizException("计划 " + plan.getPlanNo() + " 已被应急处置暂停，不能延期，闭环后自动恢复");
         }
         if (ElevatorDict.P_DONE.equals(plan.getStatus())) {
             throw new BizException("已执行的计划不能再延期");
@@ -210,6 +219,7 @@ public class MaintenanceService {
         order.setElevatorId(elevator.getId());
         order.setUnitId(elevator.getUnitId());
         order.setBuildingId(elevator.getBuildingId());
+        order.setOrderKind(ElevatorDict.KIND_NORMAL);
         order.setCycle(cycle);
         order.setPlanDate(req.getPlanDate() == null ? LocalDate.now() : req.getPlanDate());
         order.setTeam(trim(req.getTeam()));
@@ -224,12 +234,17 @@ public class MaintenanceService {
     @Transactional
     public Views.OrderView executeOrder(Long id, MaintenanceDtos.ExecuteReq req) {
         MaintenanceOrder order = orderRepository.findById(id).orElseThrow(() -> new BizException("维保工单不存在：id=" + id));
+        if (ElevatorDict.KIND_EMERGENCY.equals(order.getOrderKind())) {
+            throw new BizException("抢修工单 " + order.getOrderNo() + " 由应急报修 " + order.getFaultNo()
+                    + " 联动驱动，请到故障处置界面推进，不能按普通工单执行");
+        }
         if (ElevatorDict.P_VOID.equals(order.getStatus())) {
             throw new BizException("工单 " + order.getOrderNo() + " 已作废，不能再执行");
         }
         if (ElevatorDict.P_DONE.equals(order.getStatus())) {
             throw new BizException("工单 " + order.getOrderNo() + " 已执行，不要重复执行");
         }
+        elevatorRepository.findById(order.getElevatorId()).ifPresent(this::checkElevatorUsable);
         String result = req == null ? null : trim(req.getExecuteResult());
         if (result == null || result.isEmpty()) {
             throw new BizException("执行结果不能为空");
@@ -248,6 +263,9 @@ public class MaintenanceService {
     @Transactional
     public Views.OrderView delayOrder(Long id, MaintenanceDtos.DelayReq req) {
         MaintenanceOrder order = orderRepository.findById(id).orElseThrow(() -> new BizException("维保工单不存在：id=" + id));
+        if (ElevatorDict.KIND_EMERGENCY.equals(order.getOrderKind())) {
+            throw new BizException("抢修工单 " + order.getOrderNo() + " 不能延期，它随应急报修 " + order.getFaultNo() + " 闭环");
+        }
         if (ElevatorDict.P_VOID.equals(order.getStatus())) {
             throw new BizException("已作废的工单不能再延期");
         }
@@ -269,6 +287,11 @@ public class MaintenanceService {
     @Transactional
     public Views.OrderView voidOrder(Long id) {
         MaintenanceOrder order = orderRepository.findById(id).orElseThrow(() -> new BizException("维保工单不存在：id=" + id));
+        if (ElevatorDict.KIND_EMERGENCY.equals(order.getOrderKind())
+                && !ElevatorDict.isFaultTerminal(order.getStatus())) {
+            throw new BizException("抢修工单 " + order.getOrderNo() + " 正在处置中，不能删除/作废，"
+                    + "需在故障处置界面闭环，或判定误报后随报修单撤销");
+        }
         if (ElevatorDict.P_DONE.equals(order.getStatus())) {
             throw new BizException("已执行的工单不能作废");
         }
@@ -292,6 +315,10 @@ public class MaintenanceService {
         if (ElevatorDict.ST_OUT.equals(elevator.getStatus())) {
             throw new BizException("电梯 " + elevator.getElevatorNo() + " 已停用，不能排计划或开单");
         }
+        if (ElevatorDict.ST_EMERGENCY.equals(elevator.getStatus())) {
+            throw new BizException("电梯 " + elevator.getElevatorNo()
+                    + " 正处于应急维修，不能新建普通维保计划或工单，待应急闭环后自动恢复");
+        }
     }
 
     private String requireCycle(String cycle) {
@@ -308,6 +335,7 @@ public class MaintenanceService {
     }
 
     private Views.PlanView toPlanView(MaintenancePlan plan, NameContext ctx) {
+        boolean suspended = ElevatorDict.P_SUSPENDED.equals(plan.getStatus());
         return new Views.PlanView(
                 plan.getId(),
                 plan.getPlanNo(),
@@ -325,6 +353,9 @@ public class MaintenanceService {
                 plan.getWorker(),
                 plan.getStatus(),
                 ElevatorDict.planStatusName(plan.getStatus()),
+                suspended,
+                plan.getOccupiedReason(),
+                plan.getPrevStatus(),
                 plan.getRemark(),
                 plan.getUpdatedAt());
     }
@@ -332,6 +363,9 @@ public class MaintenanceService {
     private Views.OrderView toOrderView(MaintenanceOrder order, NameContext ctx) {
         String planNo = order.getPlanId() == null ? null
                 : planRepository.findById(order.getPlanId()).map(MaintenancePlan::getPlanNo).orElse(null);
+        boolean emergency = ElevatorDict.KIND_EMERGENCY.equals(order.getOrderKind());
+        String statusName = emergency ? ElevatorDict.emergencyStatusName(order.getStatus())
+                : ElevatorDict.planStatusName(order.getStatus());
         return new Views.OrderView(
                 order.getId(),
                 order.getOrderNo(),
@@ -343,15 +377,20 @@ public class MaintenanceService {
                 ctx.unitNo(order.getUnitId()),
                 order.getBuildingId(),
                 ctx.buildingName(order.getBuildingId()),
+                order.getOrderKind(),
+                emergency ? "应急抢修" : "常规维保",
                 order.getCycle(),
-                ElevatorDict.cycleName(order.getCycle()),
+                order.getCycle() == null ? "" : ElevatorDict.cycleName(order.getCycle()),
                 order.getPlanDate(),
                 order.getTeam(),
                 order.getWorker(),
                 order.getExecuteResult(),
                 order.getActualDate(),
                 order.getStatus(),
-                ElevatorDict.planStatusName(order.getStatus()),
+                statusName,
+                order.getFaultId(),
+                order.getFaultNo(),
+                order.getArriveTime(),
                 order.getRemark(),
                 order.getUpdatedAt());
     }

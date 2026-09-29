@@ -24,6 +24,9 @@
       <div class="top-stats">
         <div class="stat-chip"><b>{{ overview.runningCount || 0 }}</b><span>运行中</span></div>
         <div class="stat-chip"><b>{{ overview.repairingCount || 0 }}</b><span>维修</span></div>
+        <div class="stat-chip" :class="{ 'is-alert': (overview.emergencyActiveCount || 0) > 0 }">
+          <b>{{ overview.emergencyActiveCount || 0 }}</b><span>应急维修中</span>
+        </div>
         <div class="stat-chip"><b>{{ overview.inspectingCount || 0 }}</b><span>年检中</span></div>
         <div class="stat-chip" :class="{ 'is-alert': (overview.inspectDueCount || 0) > 0 }">
           <b>{{ overview.inspectDueCount || 0 }}</b><span>年检临期</span>
