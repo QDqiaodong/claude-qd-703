@@ -150,8 +150,8 @@ public class ElevatorService {
         }
         String status = req.getStatus() == null || req.getStatus().isBlank()
                 ? ElevatorDict.ST_RUNNING : trim(req.getStatus()).toUpperCase();
-        if (!ElevatorDict.isValidElevatorStatus(status)) {
-            throw new BizException("电梯状态只能是 RUNNING/OUT_OF_SERVICE/REPAIRING/INSPECTING，收到的是：" + req.getStatus());
+        if (!ElevatorDict.isValidElevatorStatus(status) || ElevatorDict.ST_EMERGENCY.equals(status)) {
+            throw new BizException("建档电梯状态只能是 RUNNING/OUT_OF_SERVICE/REPAIRING/INSPECTING，应急维修由应急流程自动进入");
         }
         Elevator elevator = new Elevator();
         elevator.setElevatorNo(elevatorNo);
@@ -179,7 +179,14 @@ public class ElevatorService {
                 .orElseThrow(() -> new BizException("电梯不存在：id=" + id));
         String target = status == null ? "" : trim(status).toUpperCase();
         if (!ElevatorDict.isValidElevatorStatus(target)) {
-            throw new BizException("电梯状态只能是 RUNNING/OUT_OF_SERVICE/REPAIRING/INSPECTING，收到的是：" + status);
+            throw new BizException("电梯状态只能是 RUNNING/OUT_OF_SERVICE/REPAIRING/INSPECTING/EMERGENCY，收到的是：" + status);
+        }
+        if (ElevatorDict.ST_EMERGENCY.equals(elevator.getStatus())
+                && !ElevatorDict.ST_EMERGENCY.equals(target)) {
+            throw new BizException("电梯正处于应急维修占用，不能手动改状态；请在故障报修中闭环或撤销应急单后自动恢复");
+        }
+        if (ElevatorDict.ST_EMERGENCY.equals(target) && elevator.getEmergencyLock() == null) {
+            throw new BizException("应急维修状态只能由应急报修受理自动进入，不能手动设置");
         }
         elevator.setStatus(target);
         elevator.setUpdatedAt(LocalDateTime.now());
@@ -208,6 +215,8 @@ public class ElevatorService {
     private Views.ElevatorView toView(Elevator elevator, Map<Long, String> unitNo, Map<Long, String> buildingName) {
         String uNo = unitNo.getOrDefault(elevator.getUnitId(), "");
         String bName = buildingName.getOrDefault(elevator.getBuildingId(), "");
+        String emergencyFaultNo = elevator.getEmergencyLock() == null ? null
+                : "FR-2026-" + String.format("%04d", elevator.getEmergencyLock());
         return new Views.ElevatorView(
                 elevator.getId(),
                 elevator.getElevatorNo(),
@@ -228,6 +237,9 @@ public class ElevatorService {
                 ElevatorDict.elevatorStatusName(elevator.getStatus()),
                 currentFloorOf(elevator),
                 inspectDueDays(elevator.getNextInspectDate()),
+                ElevatorDict.ST_EMERGENCY.equals(elevator.getStatus()),
+                elevator.getEmergencyLock(),
+                emergencyFaultNo,
                 elevator.getUpdatedAt());
     }
 

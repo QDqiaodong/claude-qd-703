@@ -42,8 +42,8 @@ public class MaintenanceOrder {
     @Column(name = "building_id", nullable = false)
     private Long buildingId;
 
-    /** 维保周期：HALF_MONTH / MONTH / QUARTER / HALF_YEAR / YEAR */
-    @Column(name = "cycle", nullable = false, length = 16)
+    /** 维保周期：HALF_MONTH / MONTH / QUARTER / HALF_YEAR / YEAR（抢修工单为空） */
+    @Column(name = "cycle", length = 16)
     private String cycle;
 
     /** 计划执行日 */
@@ -66,9 +66,21 @@ public class MaintenanceOrder {
     @Column(name = "actual_date")
     private LocalDate actualDate;
 
-    /** PENDING 待执行 / DONE 已执行 / DELAYED 已延期 / VOID 作废 */
+    /** PENDING 待执行 / DONE 已执行 / DELAYED 已延期 / VOID 作废；抢修工单另用 WAIT_ACCEPT 待验收 */
     @Column(name = "status", nullable = false, length = 16)
     private String status;
+
+    /** NORMAL 普通维保工单 / RESCUE 应急抢修工单 */
+    @Column(name = "order_type", nullable = false, length = 16)
+    private String orderType;
+
+    /** 抢修工单来源应急报修单 id（普通工单为 null，库上唯一：一张应急单只能有一张抢修单） */
+    @Column(name = "fault_id")
+    private Long faultId;
+
+    /** 抢修工单来源应急报修单号（冗余，故障/工单/电梯三处单号一致） */
+    @Column(name = "fault_no", length = 24)
+    private String faultNo;
 
     @Column(name = "remark", length = 128)
     private String remark;

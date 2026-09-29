@@ -43,11 +43,23 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * 唯一约束冲突：400（避免在页面上抛出非人话的外键报错）
+     * 唯一约束冲突：400（避免在页面上抛出非人话的外键报错）。
+     * 应急并发场景下（抢修工单/电梯占用唯一键）给出明确提示：只允许一个成功，另一个请刷新重试。
      */
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ResponseEntity<ApiResponse<Void>> handleIntegrity(DataIntegrityViolationException e) {
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(ApiResponse.fail("存在唯一性约束冲突，请检查编号、手机号是否重复"));
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.fail("数据冲突：同一资源正在被并发处理，只允许一个操作成功，请刷新列表后重试（不存在半条关联数据）"));
+    }
+
+    /**
+     * 乐观锁冲突（两个操作员同时受理/闭环同一应急单）：409
+     */
+    @ExceptionHandler(org.springframework.orm.ObjectOptimisticLockingFailureException.class)
+    public ResponseEntity<ApiResponse<Void>> handleOptimistic(
+            org.springframework.orm.ObjectOptimisticLockingFailureException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ApiResponse.fail("该单据刚被其他操作员更新（并发受理/闭环），本次操作未生效，请刷新列表后重试"));
     }
 
     /**

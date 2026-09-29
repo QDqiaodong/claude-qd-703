@@ -11,4 +11,7 @@ public interface MaintenancePlanRepository extends JpaRepository<MaintenancePlan
     List<MaintenancePlan> findAllByOrderByPlanDateDesc();
 
     boolean existsByPlanNo(String planNo);
+
+    /** 被某张应急报修单暂停的计划（闭环/撤销时恢复） */
+    List<MaintenancePlan> findBySuspendedByFaultId(Long suspendedByFaultId);
 }

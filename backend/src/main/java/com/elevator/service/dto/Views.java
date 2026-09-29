@@ -82,6 +82,11 @@ public final class Views {
         private Integer currentFloor;
         /** 距下次年检天数，负数表示已超期 */
         private Long inspectDueDays;
+        /** 是否被应急报修占用（status=EMERGENCY） */
+        private Boolean emergencyOccupied;
+        /** 占用该电梯的应急报修单 id / 单号 */
+        private Long emergencyFaultId;
+        private String emergencyFaultNo;
         private LocalDateTime updatedAt;
     }
 
@@ -124,6 +129,13 @@ public final class Views {
         private String status;
         private String statusName;
         private String remark;
+        /** 是否被应急占用暂停 */
+        private Boolean suspended;
+        /** 暂停来源：应急报修单号 + 占用原因 */
+        private String suspendedByFaultNo;
+        private String suspendReason;
+        private String statusBeforeSuspend;
+        private LocalDateTime suspendedAt;
         private LocalDateTime updatedAt;
     }
 
@@ -150,6 +162,12 @@ public final class Views {
         private LocalDate actualDate;
         private String status;
         private String statusName;
+        /** NORMAL 普通维保工单 / RESCUE 应急抢修工单 */
+        private String orderType;
+        private String orderTypeName;
+        /** 抢修工单来源应急报修单 */
+        private Long faultId;
+        private String faultNo;
         private String remark;
         private LocalDateTime updatedAt;
     }
@@ -170,18 +188,67 @@ public final class Views {
         private String buildingName;
         private String faultType;
         private String faultTypeName;
+        /** HIGH / NORMAL */
+        private String riskLevel;
+        private String riskLevelName;
+        /** 是否应急报修（困人/停梯） */
+        private Boolean emergency;
         private LocalDateTime reportTime;
+        private LocalDateTime acceptTime;
         private Integer responseMinutes;
         private Integer arriveMinutes;
+        private LocalDateTime actualArriveTime;
         private LocalDateTime fixTime;
         private Integer trapped;
         private String handleResult;
         private String reporter;
+        /** 当前负责人 */
+        private String owner;
+        /** 关联抢修工单 */
+        private Long rescueOrderId;
+        private String rescueOrderNo;
+        /** 误报撤销原因 */
+        private String cancelReason;
+        /** 处置阶段中文名 */
+        private String stage;
         private String status;
         private String statusName;
+        /** 是否已闭环（已修复/已撤销） */
+        private Boolean closed;
         /** 到达时长超过 30 分钟红线 */
         private Boolean arriveOverdue;
+        /** 电梯当前状态（应急维修等，三处一致展示用） */
+        private String elevatorStatus;
+        private String elevatorStatusName;
         private LocalDateTime updatedAt;
+    }
+
+    /** 应急处置操作记录 */
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class FaultLogView {
+        private Long id;
+        private Long faultId;
+        private String faultNo;
+        private String action;
+        private String actionName;
+        private String fromStatus;
+        private String toStatus;
+        private String operator;
+        private String detail;
+        private LocalDateTime createdAt;
+    }
+
+    /** 故障详情：故障行点开抽屉时，故障本体 + 关联抢修工单 + 被暂停计划 + 操作记录 */
+    @Data
+    @NoArgsConstructor
+    @AllArgsConstructor
+    public static class FaultDetailView {
+        private Views.FaultView fault;
+        private Views.OrderView rescueOrder;
+        private List<Views.PlanView> suspendedPlans;
+        private List<Views.FaultLogView> logs;
     }
 
     // ---------------- 模块五：配件更换 ----------------
@@ -253,6 +320,10 @@ public final class Views {
         private Long orderPendingCount;
         private Long faultOpenCount;
         private Long faultTrappedCount;
+        /** 未闭环应急报修数（高风险处置台口径） */
+        private Long emergencyOpenCount;
+        /** 应急维修占用电梯数 */
+        private Long elevatorEmergencyCount;
         private BigDecimal partAmount;
     }
 

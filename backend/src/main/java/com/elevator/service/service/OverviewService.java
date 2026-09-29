@@ -67,20 +67,29 @@ public class OverviewService {
             } else if (ElevatorDict.P_DELAYED.equals(plan.getStatus())) {
                 planDelayed++;
             }
+            // SUSPENDED（应急暂停）原计划仍保留，但不计入待执行/延期，避免顶部计数虚高
         }
         long orderPending = 0;
         for (MaintenanceOrder order : orderRepository.findAll()) {
+            // 抢修工单（RESCUE）随应急处置台统计，不计入普通待办工单
+            if (ElevatorDict.ORDER_RESCUE.equals(order.getOrderType())) {
+                continue;
+            }
             if (ElevatorDict.P_PENDING.equals(order.getStatus()) || ElevatorDict.P_DELAYED.equals(order.getStatus())) {
                 orderPending++;
             }
         }
         long faultOpen = 0;
         long faultTrapped = 0;
+        long emergencyOpen = 0;
         for (FaultReport report : faultRepository.findAll()) {
-            if (!ElevatorDict.F_FIXED.equals(report.getStatus())) {
+            if (!ElevatorDict.isFaultClosed(report.getStatus())) {
                 faultOpen++;
                 if (report.getTrapped() != null && report.getTrapped() > 0) {
                     faultTrapped++;
+                }
+                if (report.getEmergencyFlag() != null && report.getEmergencyFlag() == 1) {
+                    emergencyOpen++;
                 }
             }
         }
@@ -104,6 +113,8 @@ public class OverviewService {
                 orderPending,
                 faultOpen,
                 faultTrapped,
+                emergencyOpen,
+                elevatorRepository.countByStatus(ElevatorDict.ST_EMERGENCY),
                 partAmount.setScale(2, java.math.RoundingMode.HALF_UP));
     }
 }

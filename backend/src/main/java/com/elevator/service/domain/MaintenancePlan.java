@@ -54,9 +54,28 @@ public class MaintenancePlan {
     @Column(name = "worker", length = 32)
     private String worker;
 
-    /** PENDING 待执行 / DONE 已执行 / DELAYED 已延期 / VOID 作废 */
+    /** PENDING 待执行 / DONE 已执行 / DELAYED 已延期 / VOID 作废 / SUSPENDED 应急暂停 */
     @Column(name = "status", nullable = false, length = 16)
     private String status;
+
+    /** 暂停该计划的应急报修单 id（NULL 未暂停） */
+    @Column(name = "suspended_by_fault_id")
+    private Long suspendedByFaultId;
+
+    /** 暂停该计划的应急报修单号（冗余） */
+    @Column(name = "suspended_by_fault_no", length = 24)
+    private String suspendedByFaultNo;
+
+    /** 被占用原因，如「电梯 EL-... 应急抢修中（FR-...）」 */
+    @Column(name = "suspend_reason", length = 128)
+    private String suspendReason;
+
+    @Column(name = "suspended_at")
+    private java.time.LocalDateTime suspendedAt;
+
+    /** 暂停前状态 PENDING/DELAYED，闭环/撤销后恢复 */
+    @Column(name = "status_before_suspend", length = 16)
+    private String statusBeforeSuspend;
 
     @Column(name = "remark", length = 128)
     private String remark;
